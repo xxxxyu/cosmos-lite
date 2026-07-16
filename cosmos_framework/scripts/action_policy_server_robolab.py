@@ -11,7 +11,7 @@ The server uses OpenPI's WebsocketPolicyServer and speaks its msgpack+NumPy prot
 
 Example:
 
-  PYTHONPATH=. python -m cosmos_framework.scripts.action_policy_server_robolab \
+  python -m cosmos_framework.scripts.action_policy_server_robolab \
     --checkpoint-path nvidia/Cosmos3-Nano-Policy-DROID \
     --port 8000
 """
@@ -25,8 +25,10 @@ from cosmos_framework.inference.common.init import init_script
 
 init_script()
 
+import json
 import socket
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -36,6 +38,7 @@ import pydantic
 import torch
 import torch.nn.functional as F
 import tyro
+from torch import nn
 
 from cosmos_framework.data.generator.action.domain_utils import get_domain_id
 from cosmos_framework.data.generator.action.pose_utils import (
@@ -57,6 +60,12 @@ from cosmos_framework.scripts.action_policy_server_utils import (
     get_local_ip,
     maybe_init_distributed,
 )
+from cosmos_framework.scripts.robolab_quant_bundle import (
+    materialize_robolab_bundle_config,
+    validate_robolab_quant_bundle,
+)
+from cosmos_framework.scripts.robolab_quant_runtime import RobolabDirectQuantLoader
+from cosmos_framework.scripts.robolab_quant_runtime import QuantLinearWithOptionalBias
 from cosmos_framework.utils import log
 from cosmos_framework.utils.checkpoint_db import CheckpointDirHf
 from cosmos_framework.utils.lazy_config import instantiate
@@ -80,6 +89,46 @@ _ROBOLAB_POLICY_HF_REPOSITORIES = {
 }
 
 ActionSpace = Literal["joint_pos", "midtrain"]
+
+
+def _cuda_memory() -> dict[str, float]:
+    if not torch.cuda.is_available():
+        return {}
+    return {
+        "cuda_allocated_gb": torch.cuda.memory_allocated() / 1e9,
+        "cuda_reserved_gb": torch.cuda.memory_reserved() / 1e9,
+        "cuda_max_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
+        "cuda_max_reserved_gb": torch.cuda.max_memory_reserved() / 1e9,
+    }
+
+
+def _write_profile_event(path: Path | None, event: str, **fields: Any) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"event": event, "ts": time.time(), **fields, **_cuda_memory()}
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _configure_quant_vae_runtime(config_path: Path, args: "RobolabServerArgs") -> None:
+    """Lower VAE encode peak memory without changing the encoded clip."""
+
+    chunk_frames = int(args.vae_encode_chunk_frames)
+    if chunk_frames <= 0 or chunk_frames % 4 != 0:
+        raise ValueError("--vae-encode-chunk-frames must be a positive multiple of 4")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    tokenizer = config["model"]["config"]["tokenizer"]
+    mapping = tokenizer.get("encode_chunk_frames")
+    if not isinstance(mapping, dict):
+        mapping = {"256": 68, "480": 24, "720": 12}
+    resolution = str(args.resolution or "480")
+    mapping[resolution] = chunk_frames
+    tokenizer["encode_chunk_frames"] = mapping
+    exact_durations = {int(value) for value in tokenizer.get("encode_exact_durations") or []}
+    exact_durations.add(int(args.action_chunk_size or _DEFAULT_ACTION_CHUNK_SIZE) + 1)
+    tokenizer["encode_exact_durations"] = sorted(exact_durations)
+    config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _load_checkpoint_metadata(checkpoint_path: str) -> dict[str, Any] | None:
@@ -308,20 +357,34 @@ class RobolabServerArgs(pydantic.BaseModel):
     """Hydra experiment overrides forwarded to OmniSetup for DCP checkpoint loading."""
     credential_path: str | None = None
     """Optional checkpoint object-store credential path for DCP/S3 loading."""
+    quant_import_dir: str | None = None
+    """Self-contained DROID packed W4/W8 bundle. It replaces --checkpoint-path at runtime."""
+    profile_jsonl: Path | None = None
+    """Optional JSONL output for load, memory, and request latency events."""
+    vae_encode_chunk_frames: int = 8
+    """VAE temporal encode chunk for the serving resolution; smaller values reduce peak memory."""
+    capture_dir: Path | None = None
+    """Optional directory for deterministic request/response replay captures."""
+    calibration_stats_output: Path | None = None
+    """Optional output for per-Linear input-channel amax statistics collected during requests."""
 
     port: int = 8000
     """WebSocket port to bind."""
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     """WebSocket host to bind."""
     domain_name: str = "droid_lerobot"
     """Action domain name passed to get_domain_id()."""
     decode_video: bool = False
     """If set, decode and return the predicted rollout video as a uint8 NumPy array."""
+    guardrails: bool = False
+    """Enable Cosmos content guardrails. Disabled by default for offline robot policy serving."""
 
     output_dir: Path | None = None
     """Output directory for OmniInference. Defaults to /tmp/cosmos3_action_server/robolab."""
     sampler: Literal["unipc", "edm"] = "unipc"
     """Diffusion sampler used by OmniInference."""
+    use_torch_compile: bool = False
+    """Compile the inference graph. Disabled by default for predictable single-robot latency."""
 
     seed: int = 0
     """Base generation seed used to initialize the request RNG."""
@@ -358,12 +421,38 @@ class RobolabPolicyService:
     def __init__(self, args: RobolabServerArgs) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for OmniMoTModel inference in this repo.")
-        resolved_checkpoint_path = _resolve_checkpoint_path(args.checkpoint_path, hf_revision=args.hf_revision)
-        args = args.model_copy(update={"checkpoint_path": resolved_checkpoint_path})
+        load_start = time.perf_counter()
+        self._profile_jsonl = args.profile_jsonl.expanduser().resolve() if args.profile_jsonl is not None else None
+        self._quant_loader: RobolabDirectQuantLoader | None = None
+        config_file_override: str | None = None
+        if args.quant_import_dir:
+            if args.checkpoint_path != _DEFAULT_DROID_POLICY_CHECKPOINT:
+                raise ValueError("--quant-import-dir is self-contained and cannot be combined with --checkpoint-path")
+            quant_root = Path(args.quant_import_dir).expanduser().resolve()
+            validation = validate_robolab_quant_bundle(quant_root)
+            runtime_root = Path(args.output_dir or _DEFAULT_ROBOLAB_OUTPUT_DIR) / "runtime"
+            materialized_config = materialize_robolab_bundle_config(quant_root, runtime_root)
+            _configure_quant_vae_runtime(materialized_config, args)
+            config_file_override = str(materialized_config)
+            args = args.model_copy(update={"checkpoint_path": str(quant_root)})
+            self._quant_loader = RobolabDirectQuantLoader(quant_root)
+            self._quant_loader.install()
+            _write_profile_event(
+                self._profile_jsonl,
+                "quant_bundle_validated",
+                bundle_dir=str(quant_root),
+                strategy=validation["strategy"],
+                modules=validation["modules"],
+                residual_state_keys=validation["residual_state_keys"],
+                bundle_bytes=validation["bundle_bytes"],
+            )
+        else:
+            resolved_checkpoint_path = _resolve_checkpoint_path(args.checkpoint_path, hf_revision=args.hf_revision)
+            args = args.model_copy(update={"checkpoint_path": resolved_checkpoint_path})
         _validate_checkpoint(args.checkpoint_path, allow_dcp_checkpoint=args.allow_dcp_checkpoint)
         maybe_init_distributed()
 
-        setup_args = self._build_setup_args(args)
+        setup_args = self._build_setup_args(args, config_file_override=config_file_override)
         log.info(
             f"[robolab-policy-server] loading model: checkpoint_path={setup_args.checkpoint_path!r} "
             f"config_file={setup_args.config_file!r} experiment={setup_args.experiment!r}"
@@ -374,6 +463,13 @@ class RobolabPolicyService:
         self.model.eval()
         assert isinstance(pipe.setup_args, OmniSetupArgs)
         self.setup_args: OmniSetupArgs = pipe.setup_args
+        _write_profile_event(
+            self._profile_jsonl,
+            "model_load",
+            checkpoint_path=self.setup_args.checkpoint_path,
+            quantized=self._quant_loader is not None,
+            elapsed_ms=(time.perf_counter() - load_start) * 1000.0,
+        )
 
         training_config = _load_training_config(self.setup_args, args.checkpoint_path)
         self._transform, inferred = self._build_transform(training_config, args)
@@ -407,6 +503,26 @@ class RobolabPolicyService:
 
         self._lock = threading.Lock()
         self._rng = np.random.default_rng(self.cfg.seed)
+        self._capture_dir = args.capture_dir.expanduser().resolve() if args.capture_dir is not None else None
+        if self._capture_dir is not None:
+            self._capture_dir.mkdir(parents=True, exist_ok=True)
+            existing = sorted(self._capture_dir.glob("sample_*.request.msgpack"))
+            self._capture_index = (
+                max(int(path.name.split("_")[1].split(".")[0]) for path in existing) + 1 if existing else 0
+            )
+        else:
+            self._capture_index = 0
+        self._calibration_stats_output = (
+            args.calibration_stats_output.expanduser().resolve()
+            if args.calibration_stats_output is not None
+            else None
+        )
+        self._calibration_stats: dict[str, torch.Tensor] = {}
+        self._calibration_hook_handles: list[Any] = []
+        if self._calibration_stats_output is not None:
+            if self._quant_loader is None:
+                raise ValueError("--calibration-stats-output currently requires a packed quant bundle")
+            self._install_calibration_hooks()
         log.info(
             f"[robolab-policy-server] ready domain={self.cfg.domain_name!r} resolution={self.cfg.resolution!r} "
             f"action_space={self.cfg.action_space} action_dim={self.cfg.action_dim} "
@@ -415,13 +531,63 @@ class RobolabPolicyService:
             f"guidance={self.cfg.guidance} num_steps={self.cfg.num_steps} shift={self.cfg.shift} "
             f"seed={self.cfg.seed} deterministic_seed={self.cfg.deterministic_seed}"
         )
+        _write_profile_event(
+            self._profile_jsonl,
+            "server_ready",
+            guidance=self.cfg.guidance,
+            num_steps=self.cfg.num_steps,
+            action_chunk_size=self.cfg.action_chunk_size,
+            vae_encode_chunk_frames=args.vae_encode_chunk_frames,
+        )
 
-    def _build_setup_args(self, args: RobolabServerArgs) -> OmniSetupArgs:
+    def _install_calibration_hooks(self) -> None:
+        def make_hook(name: str) -> Any:
+            def hook(_module: nn.Module, inputs: tuple[Any, ...]) -> None:
+                if not inputs or not isinstance(inputs[0], torch.Tensor) or inputs[0].numel() == 0:
+                    return
+                value = inputs[0].detach().reshape(-1, inputs[0].shape[-1]).abs().amax(dim=0).float()
+                previous = self._calibration_stats.get(name)
+                self._calibration_stats[name] = value if previous is None else torch.maximum(previous, value)
+
+            return hook
+
+        for module in self.model.modules():
+            if isinstance(module, QuantLinearWithOptionalBias):
+                name = module.quant_module_name
+                self._calibration_hook_handles.append(module.register_forward_pre_hook(make_hook(name)))
+        if len(self._calibration_hook_handles) != 504:
+            raise ValueError(
+                f"Expected calibration hooks for 504 packed Linear modules, found {len(self._calibration_hook_handles)}"
+            )
+
+    def _flush_calibration_stats(self) -> None:
+        if self._calibration_stats_output is None:
+            return
+        self._calibration_stats_output.parent.mkdir(parents=True, exist_ok=True)
+        cpu_stats = {name: value.detach().cpu() for name, value in self._calibration_stats.items()}
+        torch.save(cpu_stats, self._calibration_stats_output)
+
+    def _capture(self, observation: dict[str, Any], outputs: dict[str, Any]) -> None:
+        if self._capture_dir is None:
+            return
+        from openpi_client import msgpack_numpy
+
+        packer = msgpack_numpy.Packer()
+        stem = f"sample_{self._capture_index:05d}"
+        (self._capture_dir / f"{stem}.request.msgpack").write_bytes(packer.pack(observation))
+        (self._capture_dir / f"{stem}.response.msgpack").write_bytes(packer.pack(outputs))
+        self._capture_index += 1
+
+    def _build_setup_args(self, args: RobolabServerArgs, *, config_file_override: str | None = None) -> OmniSetupArgs:
         setup_overrides: dict[str, Any] = {
             "checkpoint_path": args.checkpoint_path,
             "output_dir": args.output_dir or _DEFAULT_ROBOLAB_OUTPUT_DIR,
             "sampler": args.sampler,
+            "guardrails": args.guardrails,
+            "use_torch_compile": args.use_torch_compile,
         }
+        if config_file_override is not None:
+            setup_overrides["config_file"] = config_file_override
         if args.experiment is not None:
             setup_overrides["experiment"] = args.experiment
         if args.experiment_overrides:
@@ -555,11 +721,13 @@ class RobolabPolicyService:
         return self._transform(sample, self.cfg.resolution)
 
     def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
+        request_start = time.perf_counter()
         sample = self._build_sample(obs)
         data_batch = _build_data_batch_from_sample(sample)
         seed = self._next_seed()
         log.info(f"[robolab-policy-server] prompt={data_batch['ai_caption'][0]!r} seed={seed}")
 
+        generate_start = time.perf_counter()
         with self._lock:
             with torch.inference_mode():
                 samples = self.model.generate_samples_from_batch(
@@ -569,6 +737,7 @@ class RobolabPolicyService:
                     num_steps=self.cfg.num_steps,
                     shift=self.cfg.shift,
                 )
+        generate_ms = (time.perf_counter() - generate_start) * 1000.0
 
         action = samples["action"][0][:, : self.cfg.action_dim]  # [T,D]
         action = action[self.cfg.history_length :]  # [T2,D]
@@ -597,6 +766,16 @@ class RobolabPolicyService:
             video = self.model.decode(pred_vision_latent)  # [1,C,T,H,W]
             video = ((video[0].clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 3, 0)  # [T,H,W,3]
             outputs["video"] = video.detach().cpu().numpy()
+        _write_profile_event(
+            self._profile_jsonl,
+            "request",
+            seed=seed,
+            generate_ms=generate_ms,
+            request_ms=(time.perf_counter() - request_start) * 1000.0,
+            action_rows=int(action_np.shape[0]),
+        )
+        self._capture(obs, outputs)
+        self._flush_calibration_stats()
         return outputs
 
 

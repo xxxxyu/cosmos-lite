@@ -3,9 +3,7 @@ name: Bug Report
 about: Report a reproducible bug or unexpected behavior
 title: "[BUG] <short description>"
 labels: 'bug'
-assignees:
-    - spectralflight
-    - jeanachoi
+assignees: ''
 
 ---
 
@@ -53,7 +51,7 @@ assignees:
 | Field                        | Value                                       |
 | ---------------------------- | ------------------------------------------- |
 | **Environment**              | <!-- e.g. UV, Docker -->                    |
-| **Hardware**                 | <!-- e.g. DGX H100 x8, single A100 80GB --> |
+| **Hardware**                 | <!-- e.g. RTX 4090 24GB -->                 |
 | **OS**                       | <!-- e.g. Ubuntu 22.04 / 24.04 -->          |
 | **GPU Driver**               | <!-- e.g. 580.95.05 -->                     |
 | **CUDA Version**             | <!-- e.g. 12.8.1 -->                        |
@@ -63,3 +61,9 @@ assignees:
 ## Additional Context
 
 <!-- Workarounds tried, related issues, etc. -->
+
+## Artifact And Policy Configuration
+
+<!-- For quantization issues: strategy, bundle schema/manifest hash, sampler
+guidance/steps, model source revision, task, and whether validation passed. Do
+not attach proprietary captures, model weights, tokens, or private paths. -->

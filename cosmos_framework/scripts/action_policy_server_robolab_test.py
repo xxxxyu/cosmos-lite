@@ -78,6 +78,10 @@ def test_server_args_default_to_released_droid_serving_config() -> None:
     args = robolab_server.RobolabServerArgs()
 
     assert args.checkpoint_path == "nvidia/Cosmos3-Nano-Policy-DROID"
+    assert args.host == "127.0.0.1"
+    assert args.guardrails is False
+    assert args.use_torch_compile is False
+    assert args.vae_encode_chunk_frames == 8
     assert args.hf_revision == "main"
     assert args.domain_name == "droid_lerobot"
     assert args.seed == 0

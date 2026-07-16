@@ -1,99 +1,159 @@
-<p align="center">
-    <img src="https://github.com/user-attachments/assets/28f2d612-bbd6-44a3-8795-833d05e9f05f" width="274" alt="NVIDIA Cosmos"/>
-</p>
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 Xiangyu Li.
+SPDX-License-Identifier: OpenMDW-1.1
+-->
 
-<p align="center">
-    <a href="https://github.com/NVIDIA/Cosmos">NVIDIA Cosmos</a> |
-    🤗 <a href="https://huggingface.co/collections/nvidia/cosmos3">Cosmos 3 </a>
-</p>
+# Cosmos Lite
 
-<p align="center">
-    Part of the <a href="https://github.com/NVIDIA/Cosmos">NVIDIA Cosmos</a> project family — the training and serving framework repository.
-</p>
+**Deploy 16B Cosmos 3 robot policies on a single 24GB RTX 4090.** Cosmos Lite
+adds streaming low-bit quantization, packed Marlin inference, self-contained
+artifacts, and reproducible RoboLab and RoboCasa365 evaluation pipelines to
+[NVIDIA Cosmos Framework](https://github.com/NVIDIA/Cosmos-Framework).
 
-# Cosmos-Framework
+**[Models](#prebuilt-models) | [RoboLab benchmark](examples/robolab_quant/BENCHMARKS.md) | [RoboCasa365 benchmark](examples/robocasa365_quant/BENCHMARKS.md) | [Setup](#setup) | [Contributing](CONTRIBUTING.md) | [Security](SECURITY.md)**
 
-**Cosmos-Framework** is an end-to-end framework for training and serving world models, including the **Cosmos3** model family. Everything lives in a single top-level [`cosmos_framework/`](./cosmos_framework) Python package:
+## RoboLab Rollout Demo
 
-- **Training** — distributed FSDP / TP / CP / PP trainer, native DCP checkpoints with HuggingFace `safetensors` import/export, JSONL / WebDataset / LeRobot dataset adapters. Entry point: `cosmos_framework.scripts.train`. See [`docs/training.md`](./docs/training.md).
-- **Inference** — Diffusers / Transformers / vLLM backends with offline batch generation and online serving (Ray + Gradio). Entry point: `cosmos_framework.scripts.inference`. Ecosystem-facing shim libraries (lightweight standalone wrappers for downstream projects) live under [`packages/`](./packages).
+<!-- rumdl-disable MD034 -->
+https://github.com/user-attachments/assets/76e09f1c-4f20-47e5-ac09-6dc64f30d7a3
+<!-- rumdl-enable MD034 -->
 
-## Cosmos 3
+Each quantized setting was evaluated for 50 paired Banana rollouts at guidance
+3 and four denoise steps. The demo shows three selected episodes per setting;
+the success rates below come from all 50 rollouts, not the displayed subset.
 
-**Cosmos 3** is our newest model family [[Report]](https://research.nvidia.com/labs/cosmos-lab/cosmos3/technical-report.pdf) [[Website]](https://research.nvidia.com/labs/cosmos-lab/cosmos3/). It is a suite of omnimodal world models designed to jointly process and generate language, images, video, audio, and action sequences within a unified Mixture-of-Transformers architecture. By supporting highly flexible input-output configurations, it seamlessly unifies critical modalities for Physical AI — effectively subsuming vision-language models, video generators, world simulators, and world-action models into a single framework. For a guided experience to test out Cosmos3, please visit [[Cosmos]](https://github.com/nvidia/cosmos).
+## At A Glance
 
-## Framework Documentation
+| Env & Task              | Quant.       | Denoise | VRAM (GB) | Latency (ms) | SR (%) |
+| ----------------------- | ------------ | ------: | --------: | -----------: | -----: |
+| RoboLab Banana          | W8A16        |       2 |     21.42 |        2,403 |    90% |
+| RoboLab Banana          | W4A16-GenW8  |       2 |     18.03 |        2,433 |   100% |
+| RoboCasa365 CloseFridge | W4A16-AttnW8 |       4 |     14.28 |        1,231 |    96% |
 
-- [Quickstart](#setup)
-- [Setup](./docs/setup.md)
-- [Training (Supervised Fine-Tuning)](./docs/training.md)
-  - [JSONL Dataset](./docs/dataset_jsonl.md)
-- [Inference](./docs/inference.md)
-- [Policy Server](./docs/action_policy_droid_server.md)
-- Reference
-  - [Code Structure](./docs/code_structure.md)
-  - [Environment Variables](./docs/environment_variables.md)
-  - [FAQ](./docs/faq.md)
-  - [AGENTS.md](./AGENTS.md)
+VRAM is peak CUDA reserved memory and latency is p50 end-to-end policy request
+latency on RTX 4090. RoboLab success rates are 50-rollout RTX 4090 results.
+The RoboCasa success rate was reproduced in two 50-episode H100 runs with the
+same quantization and sampler settings; its VRAM and latency are RTX 4090
+measurements. All rows use guidance 3.
+
+## RoboLab Quantization Comparison
+
+| Quant.                                                                                      | VRAM (GB) | Latency (ms) |  SR (%) |
+| ------------------------------------------------------------------------------------------- | --------: | -----------: | ------: |
+| [W8A16](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W8A16)               |     21.42 |        4,110 |     86% |
+| [W4A16](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W4A16)               | **14.67** |        4,248 |     52% |
+| [W4A16-AttnW8](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W4A16-AttnW8) |     16.21 |        4,153 |     84% |
+| [W4A16-GenW8](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W4A16-GenW8)   |     18.03 |    **4,104** | **90%** |
+
+This comparison fixes guidance to 3 and denoise steps to 4. Request latency is
+p50 on RTX 4090; success rates use 50 paired Banana rollouts.
+
+## Prebuilt Models
+
+The public bundles below are self-contained quantized derivatives of
+[`nvidia/Cosmos3-Nano-Policy-DROID`](https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID).
+They include packed weights, residual weights, config, tokenizer, VAE,
+provenance, sizes, and SHA256 hashes.
+
+| Model                                                                                       | Precision       |  Bundle size | Notes                                      |
+| ------------------------------------------------------------------------------------------- | --------------- | -----------: | ------------------------------------------ |
+| [W8A16](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W8A16)               | 504 W8 modules  |     20.44 GB | **General default**                        |
+| [W4A16](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W4A16)               | 504 W4 modules  | **13.72 GB** | Minimum memory; failed Banana quality gate |
+| [W4A16-AttnW8](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W4A16-AttnW8) | 216 W4 / 288 W8 |     15.18 GB | Lower memory; verified on Banana           |
+| [W4A16-GenW8](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W4A16-GenW8)   | 252 W4 / 252 W8 |     17.08 GB | Verified on Banana; validate transfer      |
+
+W4 and mixed bundles were calibrated with 128 frames from 128 distinct
+episodes in the official DROID `train/success` split. No Banana evaluation
+episode was used for calibration. The Notes column describes rollout evidence,
+not task-specific calibration or training.
+
+These are weight-only bundles; activations remain BF16. They use the Cosmos
+Lite schema-v2 format and vLLM Marlin WNA16 kernels, not a generic GPTQ/AWQ
+loader contract. RoboCasa365 uses a task-fine-tuned checkpoint, so build its
+bundle with the provided pipeline instead of using the DROID weights above.
+
+## What Cosmos Lite Adds
+
+- Streaming export from BF16 or DCP checkpoints without placing the full
+  source model on GPU.
+- Packed W4A16, W8A16, and fixed mixed-precision plans with direct loading
+  below 24GB on the tested RTX 4090 paths.
+- Calibration from training data for W4 and mixed strategies; full W8 does not
+  require calibration.
+- Strong artifact validation covering schema, precision map, tensor payloads,
+  sizes, provenance, and SHA256 hashes.
+- Deterministic replay, latency profiling, and closed-loop rollout entry points
+  for RoboLab and RoboCasa365.
+- A locked CUDA 12.8 policy runtime isolated from simulator dependencies.
 
 ## Setup
 
-For more details and alternative installation methods, see [Setup](./docs/setup.md#installation). Before installing, make sure your machine meets the [System Requirements](./docs/setup.md#system-requirements). If you want a curated PyTorch + CUDA environment, start from the [recommended NVIDIA NGC base image](./docs/setup.md#recommended-base-image).
+Requirements: Linux x86-64, Python 3.13, `uv`, a CUDA 12.8-compatible NVIDIA
+driver, and an Ampere-or-newer GPU. RTX 4090 24GB is the tested target.
 
-Install system dependencies:
-
-```shell
-sudo apt-get install -y --no-install-recommends curl ffmpeg git-lfs libx11-dev tree wget
+```bash
+git clone https://github.com/xxxxyu/cosmos-lite.git
+cd cosmos-lite
+CUDA_VISIBLE_DEVICES=0 examples/quantized_robot_policy/setup.sh
 ```
-
-Install the package with `uv` (pick the dependency group that matches your CUDA toolkit — see [CUDA Variants](./docs/setup.md#cuda-variants)):
-
-```shell
-# CUDA 13.0 (recommended)
-uv sync --all-extras --group=cu130-train
-# Or, for CUDA 12.8:
-# uv sync --all-extras --group=cu128-train
-source .venv/bin/activate && export LD_LIBRARY_PATH=
-```
-
-If you are starting from the recommended NGC image (`nvcr.io/nvidia/pytorch:25.09-py3`), see the [one-shot quickstart](./docs/setup.md#quickstart-from-the-recommended-base-image).
-
-## Training
-
-For the full guide (data preparation, base-checkpoint conversion, parallelism strategies, mixed precision, resuming), see [Training](./docs/training.md). The number of GPUs required depends on the recipe; the shipped recipes under [`examples/`](./examples/README.md) are 8-GPU configurations (tested on 8× H100 80 GB) launched via their paired launch shells, e.g.:
-
-```shell
-bash examples/launch_sft_vision_nano.sh
-```
-
-Users may adjust the GPU count to match their model and underlying hardware architecture — tune `NPROC_PER_NODE` and the parallelism degrees (DP/CP/FSDP shard) in the recipe accordingly.
 
 ## Inference
 
-See [Inference](./docs/inference.md) for the full guide — launch commands, supported modes, parallelism presets, and troubleshooting.
+Choose a pipeline:
 
-Quick single-GPU launch:
+- [RoboLab](examples/robolab_quant/README.md): download a prebuilt model or
+  build from the public NVIDIA DROID policy, validate, replay, and roll out.
+- [RoboCasa365](examples/robocasa365_quant/README.md): stream-pack a
+  task-fine-tuned BF16 DCP checkpoint, then validate, replay, and roll out.
 
-```shell
-python -m cosmos_framework.scripts.inference \
-    --parallelism-preset=latency \
-    -i "inputs/omni/t2v.json" \
-    -o outputs/omni_nano \
-    --checkpoint-path Cosmos3-Nano \
-    --seed=0
+Both use the same lifecycle:
+
+```text
+setup -> build or download -> validate -> replay -> rollout
 ```
 
-## Policy Server
+Source checkpoints and calibration captures are build-time inputs only. A
+deployment needs this checkout, the locked runtime, and one validated
+self-contained bundle. Start with the
+[runtime guide](examples/quantized_robot_policy/README.md) and use the
+[release checklist](examples/quantized_robot_policy/RELEASE_CHECKLIST.md) for
+a fresh machine.
 
-See [Policy Server](./docs/action_policy_droid_server.md) for the full guide.
+## Deployment Guidance
 
-## Reference
+| Scope                             | Recommended setting | Rollback       |
+| --------------------------------- | ------------------- | -------------- |
+| General RoboLab                   | W8A16, 2 steps      | W8A16, 4 steps |
+| RoboLab Banana under lower memory | AttnW8, 4 steps     | W8A16, 4 steps |
+| RoboCasa365 CloseFridge           | AttnW8, 4 steps     | W8A16, 4 steps |
 
-| Topic                                                        | What it covers                                                                                                           |
-| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| [Setup](./docs/setup.md)                                     | Hardware/software prerequisites, `uv` install paths, CUDA variants, Docker base image, and base-checkpoint downloading.  |
-| [Code Structure](./docs/code_structure.md)                   | Repository layout and a per-subpackage tour of `cosmos_framework/` — where each concern lives and where to add new code. |
-| [Training](./docs/training.md)                               | Launching multi-GPU and multi-node runs; parallelism strategies; mixed precision; resuming.                              |
-| [Inference (from a trained checkpoint)](./docs/inference.md) | Loading a trained checkpoint into one of the inference backends.                                                         |
-| [Policy Server](./docs/action_policy_droid_server.md)        | Running the server-client pipeline for Cosmos3-Nano-Policy-DROID.                                                        |
-| [FAQ](./docs/faq.md)                                         | Troubleshooting (OOM, NCCL hangs, slow training), environment variables, and common pitfalls.                            |
+All deployment-guidance rows use guidance 3.
+
+Quantization and sampling are separate runtime controls, but they are not
+quality-orthogonal. Validate a new task, embodiment, camera contract, or
+checkpoint with replay and paired closed-loop rollouts before promoting a
+mixed strategy or accelerated sampler.
+
+## Scope And Safety
+
+The release validates batch-one Cosmos robot-policy serving on an RTX 4090.
+It does not establish quality transfer to untested tasks, robots,
+cameras, action contracts, or non-NVIDIA hardware. It is not real-robot safety
+certified.
+
+Policy servers bind to loopback by default and have no built-in TLS or
+authentication. Real-robot integration must add independent E-stop, watchdog,
+workspace/joint/action limits, stale-command rejection, rate limits, and
+operator supervision. See [SECURITY.md](SECURITY.md).
+
+## Project Status And License
+
+Cosmos Lite is an unofficial, community-maintained extension of NVIDIA Cosmos
+Framework, not an NVIDIA product or a new model family. The upstream overview
+is preserved in [UPSTREAM_README.md](UPSTREAM_README.md).
+
+This repository retains the upstream [OpenMDW-1.1 license](LICENSE) and
+[notices](NOTICE). Model weights may have additional terms at their download
+locations. OpenMDW-1.1 is a model-material license; no claim is made that it is
+OSI approved. Contributions require DCO sign-off as described in
+[CONTRIBUTING.md](CONTRIBUTING.md).

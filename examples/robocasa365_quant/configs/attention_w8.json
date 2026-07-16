@@ -1,0 +1,11 @@
+[
+  {
+    "prefix": "net.language_model.model.layers",
+    "backend": "vllm_gptq_marlin_w4a16"
+  },
+  {
+    "prefix": "net.language_model.model.layers",
+    "name_regex": "\\.self_attn\\.",
+    "backend": "vllm_gptq_marlin_w8a16"
+  }
+]

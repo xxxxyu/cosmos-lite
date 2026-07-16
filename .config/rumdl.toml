@@ -20,6 +20,9 @@ disable = [
 "README.md" = [
     "MD041" # first-line-heading
 ]
+"UPSTREAM_README.md" = [
+    "MD041" # upstream starts with its centered logo block
+]
 
 # ul-style
 [MD004]

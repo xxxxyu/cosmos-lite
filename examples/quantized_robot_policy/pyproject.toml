@@ -1,0 +1,56 @@
+[project]
+name = "cosmos-lite-robot-policy-runtime"
+version = "0.1.0"
+description = "Minimal runtime for Cosmos3 packed W4A16/W8A16 robot policies"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "cosmos-framework",
+  "diffusers-cosmos3",
+  "filelock>=3.27.0",
+  "flash-attn==2.7.4.post1+cu128.torch210",
+  "iopath>=0.1.10",
+  "natten==0.21.6.dev6+cu128.torch210",
+  "openpi-client==0.1.2",
+  "openpi-server==0.1.0",
+  "pyzmq",
+  "safetensors",
+  "torch==2.10.0+cu128",
+  "transformers-cosmos3",
+  "vllm-cosmos3",
+  "vllm==0.19.1",
+  "webdataset",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+]
+
+[tool.uv]
+required-version = ">=0.11.3"
+package = false
+override-dependencies = [
+  # openpi-client's conservative metadata still pins NumPy 1.x, while vLLM's
+  # OpenCV runtime requires NumPy 2.x. The protocol code is validated with the
+  # same NumPy 2.0-2.2 range used by the parent Cosmos project.
+  "numpy>=2.0.0,<2.3",
+]
+
+[tool.uv.sources]
+cosmos-framework = { path = "../..", editable = true }
+diffusers-cosmos3 = { path = "../../packages/diffusers-cosmos3", editable = true }
+flash-attn = { index = "cosmos" }
+natten = { index = "cosmos" }
+torch = { index = "pytorch" }
+transformers-cosmos3 = { path = "../../packages/transformers-cosmos3", editable = true }
+vllm-cosmos3 = { path = "../../packages/vllm-cosmos3", editable = true }
+
+[[tool.uv.index]]
+name = "cosmos"
+url = "https://nvidia-cosmos.github.io/cosmos-dependencies/v1.5.0"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

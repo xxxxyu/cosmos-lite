@@ -5,9 +5,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import boto3
 import filelock
-from boto3.s3.transfer import TransferConfig
 from loguru import logger as log
 
 from cosmos_framework.utils.flags import INTERNAL
@@ -41,6 +39,9 @@ def parallel_download_s3_prefix_to_dir(
     preserving relative paths. Returns list of downloaded (or skipped) local paths.
     Example of exclude_list: [".safetensors"]
     """
+    import boto3
+    from boto3.s3.transfer import TransferConfig
+
     os.makedirs(dest_dir, exist_ok=True)
 
     s3 = boto3.client("s3", **_load_s3_credentials(credential_path))
@@ -134,6 +135,8 @@ def s3_dir_exists(bucket, prefix, credentials):
     Returns:
         bool: True if the prefix exists, False otherwise.
     """
+    import boto3
+
     s3 = boto3.client("s3", **_load_s3_credentials(credentials))
     # Make sure prefix ends with "/" to represent a "directory"
     if not prefix.endswith("/"):

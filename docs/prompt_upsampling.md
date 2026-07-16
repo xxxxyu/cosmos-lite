@@ -72,7 +72,7 @@ A red sports car drives through rain at night.
 For `image2video` and `posttrain_image2video`, provide either one shared image:
 
 ```shell
---image-url inputs/prompt_upsampler/image_inputs/car_driving.jpg
+--image-url /path/to/car_driving.jpg
 ```
 
 Or provide one image per prompt:
@@ -84,8 +84,8 @@ Or provide one image per prompt:
 Image-list files must have the same number of non-empty lines as the prompt file:
 
 ```text
-inputs/prompt_upsampler/image_inputs/car_driving.jpg
-inputs/prompt_upsampler/image_inputs/humanoid_robot.jpg
+/path/to/car_driving.jpg
+/path/to/humanoid_robot.jpg
 ```
 
 Local image paths, HTTP(S) URLs, and `data:` URLs are accepted.

@@ -7,11 +7,6 @@ exclude: (?x)(
     ^tests/data/
   )
 repos:
-  - repo: https://github.com/google/addlicense
-    rev: v1.2.0
-    hooks:
-      - id: addlicense
-        args: ["-f", "ci/license.txt"]
   - repo: https://github.com/jsh9/markdown-toc-creator
     rev: 0.1.3
     hooks:

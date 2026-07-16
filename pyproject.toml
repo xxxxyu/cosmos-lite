@@ -11,7 +11,10 @@ version = "1.2.2"
 authors = [
   {name = "NVIDIA Corporation"},
 ]
-description = "Cosmos-Framework: Cosmos3 World Foundation Model (WFM)"
+maintainers = [
+  {name = "Xiangyu Li", email = "xiangyu.sdlc@foxmail.com"},
+]
+description = "Cosmos Lite: quantized Cosmos 3 robot policy deployment on a single GPU"
 requires-python = ">=3.10"
 license = {text = "OpenMDW-1.1"}
 classifiers = [
@@ -259,17 +262,14 @@ policy-server = [
 
 [project.readme]
 content-type = "text/markdown"
-text = '''
-# Cosmos3-VFM
-
-[Documentation](https://github.com/NVIDIA/cosmos-framework/blob/main/README.md)
-'''
+file = "README.md"
 
 [project.urls]
-documentation = "https://github.com/NVIDIA/cosmos-framework/blob/main/README.md"
-homepage = "https://research.nvidia.com/labs/dir/cosmos3"
-issues = "https://github.com/NVIDIA/cosmos-framework/issues"
-repository = "https://github.com/NVIDIA/cosmos-framework"
+documentation = "https://github.com/xxxxyu/cosmos-lite#readme"
+homepage = "https://github.com/xxxxyu/cosmos-lite"
+issues = "https://github.com/xxxxyu/cosmos-lite/issues"
+repository = "https://github.com/xxxxyu/cosmos-lite"
+upstream = "https://github.com/NVIDIA/Cosmos-Framework"
 
 [tool.uv]
 required-version = ">=0.11.3"

@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Xiangyu Li.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+name: Public Release Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  public-release-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: false
+      - uses: astral-sh/setup-uv@v7
+      - name: Check public tree
+        run: uv run --no-project python ci/check_public_release.py
+      - name: Check formatting
+        run: git diff --check HEAD

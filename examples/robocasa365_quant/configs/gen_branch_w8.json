@@ -1,0 +1,16 @@
+[
+  {
+    "prefix": "net.language_model.model.layers",
+    "backend": "vllm_gptq_marlin_w4a16"
+  },
+  {
+    "prefix": "net.language_model.model.layers",
+    "name_regex": "\\.self_attn\\.(q_proj_moe_gen|k_proj_moe_gen|v_proj_moe_gen|o_proj_moe_gen)$",
+    "backend": "vllm_gptq_marlin_w8a16"
+  },
+  {
+    "prefix": "net.language_model.model.layers",
+    "name_regex": "\\.mlp_moe_gen\\.",
+    "backend": "vllm_gptq_marlin_w8a16"
+  }
+]

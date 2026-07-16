@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Xiangyu Li.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: https://github.com/xxxxyu/cosmos-lite/security/policy
+    about: Report vulnerabilities privately; do not disclose them in an issue.
+  - name: NVIDIA Cosmos Framework
+    url: https://github.com/NVIDIA/Cosmos-Framework/issues
+    about: Report bugs that reproduce on an unmodified NVIDIA checkout upstream.

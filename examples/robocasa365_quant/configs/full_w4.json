@@ -1,0 +1,6 @@
+[
+  {
+    "prefix": "net.language_model.model.layers",
+    "backend": "vllm_gptq_marlin_w4a16"
+  }
+]

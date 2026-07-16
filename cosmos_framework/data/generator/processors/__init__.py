@@ -10,9 +10,6 @@ from typing import Optional
 from transformers import PreTrainedTokenizerFast
 
 from cosmos_framework.data.generator.processors.base import BaseVLMProcessor
-from cosmos_framework.data.generator.processors.nemotron3densevl_processor import Nemotron3DenseVLProcessor
-from cosmos_framework.data.generator.processors.nemotronvl_processor import NemotronVLProcessor
-from cosmos_framework.data.generator.processors.qwen3vl_processor import Qwen3VLProcessor
 from cosmos_framework.model.generator.tokenizers.tokenization_qwen2 import Qwen2Tokenizer
 from cosmos_framework.utils.generator.reasoner.pretrained_models_downloader import maybe_download_hf_model_from_s3
 
@@ -110,6 +107,8 @@ def build_processor(
     # upstream Qwen/Qwen3-VL-*-Instruct fetch. Cosmos3-Nano/Super both ship
     # a Qwen3VL-compatible processor, so dispatch to Qwen3VLProcessor.
     if os.path.isdir(tokenizer_type):
+        from cosmos_framework.data.generator.processors.qwen3vl_processor import Qwen3VLProcessor
+
         return Qwen3VLProcessor(tokenizer_type, cache_dir=cache_dir)
     if credentials is None or bucket is None:
         if config_variant is None:
@@ -122,8 +121,12 @@ def build_processor(
     elif config_variant is not None:
         raise ValueError("Provide either config_variant or (credentials, bucket), not both")
     if "Qwen/Qwen3-VL" in tokenizer_type or "Siglip2-Qwen3-1.7B" in tokenizer_type:
+        from cosmos_framework.data.generator.processors.qwen3vl_processor import Qwen3VLProcessor
+
         return Qwen3VLProcessor(tokenizer_type, credentials=credentials, bucket=bucket, cache_dir=cache_dir)
     elif "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16" in tokenizer_type:
+        from cosmos_framework.data.generator.processors.nemotronvl_processor import NemotronVLProcessor
+
         return NemotronVLProcessor(tokenizer_type, credentials=credentials, bucket=bucket, cache_dir=cache_dir)
     elif (
         "NVIDIA-Nemotron-3-Dense-VL" in tokenizer_type
@@ -131,6 +134,8 @@ def build_processor(
         or "nvidia/Cosmos3-Reasoner-2B-Private" in tokenizer_type
         or "nvidia/Cosmos3-Edge-Reasoner" in tokenizer_type
     ):
+        from cosmos_framework.data.generator.processors.nemotron3densevl_processor import Nemotron3DenseVLProcessor
+
         return Nemotron3DenseVLProcessor(tokenizer_type, credentials=credentials, bucket=bucket, cache_dir=cache_dir)
     elif "Qwen/Qwen3-0.6B" in tokenizer_type:
         local_path = _download_llm_tokenizer(tokenizer_type, credentials, bucket, cache_dir)

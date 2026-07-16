@@ -2,6 +2,18 @@ Cosmos
 
 Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 
+Cosmos Lite additions
+
+Copyright (c) 2026 Xiangyu Li.
+
+Cosmos Lite is an unofficial, community-maintained project built on NVIDIA
+Cosmos Framework. It is not an NVIDIA product, official Cosmos release, or a
+new model family. Upstream
+source and notices are retained under OpenMDW-1.1; fork-specific additions and
+modifications are identified through version control and applicable file
+headers. Third-party components remain subject to their respective licenses and
+notices, including those listed below and in ATTRIBUTIONS.md.
+
 This file contains attribution notices for third-party source code that is
 adapted, copied, or vendored in this repository. Dependency notices are listed
 separately in ATTRIBUTIONS.md.

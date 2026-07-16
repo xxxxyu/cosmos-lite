@@ -1007,6 +1007,7 @@ def _video_vae(
                 pretrained_path,
                 backend_args=backend_args,
                 map_location=device,
+                weights_only=True,
             )
 
             # load checkpoint

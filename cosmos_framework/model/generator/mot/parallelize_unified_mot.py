@@ -11,6 +11,7 @@ design (``torchtitan/distributed/activation_checkpoint.py``):
     DeepEP/HybridEP) and recomputes everything else.
 """
 
+import os
 import re
 from typing import Callable
 
@@ -306,11 +307,14 @@ def apply_compile(model: nn.Module, config: CompileConfig) -> None:
         compile_options["max_autotune_pointwise"] = True
     if config.coordinate_descent_tuning:
         compile_options["coordinate_descent_tuning"] = True
+    fullgraph = os.environ.get("COSMOS3_MOT_COMPILE_FULLGRAPH", "1") != "0"
+    if not fullgraph:
+        log.warning("MoT torch.compile is running with fullgraph=False from COSMOS3_MOT_COMPILE_FULLGRAPH=0")
 
     for layer_id, block in model.model.layers.named_children():
         block = torch.compile(
             block,
-            fullgraph=True,
+            fullgraph=fullgraph,
             dynamic=config.compile_dynamic,
             mode="reduce-overhead" if config.use_cuda_graphs else None,
             options=compile_options or None,
