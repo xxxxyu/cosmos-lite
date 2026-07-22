@@ -5,8 +5,14 @@
 
 from __future__ import annotations
 
+import atexit
 import importlib.util
+import json
+import math
+import os
 import sys
+import threading
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +20,59 @@ import torch
 from torch import nn
 
 from cosmos_framework.scripts.robolab_quant_bundle import validate_robolab_quant_bundle
+
+_LINEAR_SHAPES_JSONL = os.environ.get("COSMOS3_LINEAR_SHAPES_JSONL", "")
+_LINEAR_SHAPE_COUNTS: Counter[tuple[str, str, int, int, int, str]] = Counter()
+_LINEAR_SHAPE_LOCK = threading.Lock()
+
+
+def _record_quant_linear_shape(name: str, backend: nn.Module, x: torch.Tensor) -> None:
+    if not _LINEAR_SHAPES_JSONL or not isinstance(x, torch.Tensor) or x.ndim == 0:
+        return
+    batch_tokens = int(math.prod(x.shape[:-1])) if x.ndim > 1 else 1
+    key = (
+        name,
+        type(backend).__name__,
+        batch_tokens,
+        int(x.shape[-1]),
+        int(backend.size_n),
+        str(x.dtype).removeprefix("torch."),
+    )
+    with _LINEAR_SHAPE_LOCK:
+        _LINEAR_SHAPE_COUNTS[key] += 1
+
+
+def _flush_quant_linear_shapes() -> None:
+    if not _LINEAR_SHAPES_JSONL:
+        return
+    with _LINEAR_SHAPE_LOCK:
+        items = list(_LINEAR_SHAPE_COUNTS.items())
+        _LINEAR_SHAPE_COUNTS.clear()
+    if not items:
+        return
+    path = Path(_LINEAR_SHAPES_JSONL).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for (name, backend_class, batch_tokens, in_features, out_features, dtype), count in sorted(items):
+            f.write(
+                json.dumps(
+                    {
+                        "event": "quant_linear_shape",
+                        "name": name,
+                        "backend_class": backend_class,
+                        "batch_tokens": batch_tokens,
+                        "in_features": in_features,
+                        "out_features": out_features,
+                        "input_dtype": dtype,
+                        "count": count,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+
+atexit.register(_flush_quant_linear_shapes)
 
 
 class QuantLinearWithOptionalBias(nn.Module):
@@ -27,6 +86,7 @@ class QuantLinearWithOptionalBias(nn.Module):
             self.bias = nn.Parameter(bias.detach().to(torch.bfloat16), requires_grad=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _record_quant_linear_shape(self.quant_module_name, self.backend, x)
         output = self.backend(x)
         return output if self.bias is None else output + self.bias
 
@@ -149,6 +209,7 @@ class RobolabDirectQuantLoader:
             config: Any = None,
             parallelism_config: Any = None,
             compile_config: Any = None,
+            quantization_config: Any = None,
         ) -> Any:
             checkpoint_root = Path(checkpoint_path).expanduser().resolve()
             if checkpoint_root != expected_root:
@@ -158,6 +219,7 @@ class RobolabDirectQuantLoader:
                     config=config,
                     parallelism_config=parallelism_config,
                     compile_config=compile_config,
+                    quantization_config=quantization_config,
                 )
             if config is None:
                 raise ValueError("A RoboLab quant bundle must use its bundled runtime config")
@@ -165,9 +227,15 @@ class RobolabDirectQuantLoader:
                 parallelism_config = inference_model.ParallelismConfig()
             if compile_config is None:
                 compile_config = inference_model.CompileConfig()
+            if quantization_config is None:
+                quantization_config = inference_model.QuantizationConfig()
             config.parallelism = inference_model.attrs.asdict(parallelism_config)
             config.compile = inference_model.attrs.asdict(compile_config)
+            config.quantization = inference_model.attrs.asdict(quantization_config)
             model = cls(config)
+            language_model = getattr(getattr(model.model, "net", None), "language_model", None)
+            if language_model is not None:
+                language_model._local_checkpoint_dir = str(expected_root)
             if not loader._applied:
                 raise RuntimeError(
                     "Packed modules were not installed before model materialization; refusing a hidden BF16 fallback"

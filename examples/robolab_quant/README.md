@@ -6,11 +6,10 @@ SPDX-License-Identifier: OpenMDW-1.1
 # Cosmos3 RoboLab Quantized Pipeline
 
 This is the release entry point for downloading or building a self-contained
-packed W4A16/W8A16 Cosmos3 Nano Policy DROID bundle and running it against
-RoboLab on RTX 4090.
-
-Read [BENCHMARKS.md](BENCHMARKS.md) before changing the default strategy or
-sampler.
+packed W4A16/W8A16 Cosmos3 Nano or Edge Policy DROID bundle and running it
+against RoboLab on RTX 4090. See [NANO_BENCHMARKS.md](NANO_BENCHMARKS.md) for
+Nano and [EDGE_BENCHMARKS.md](EDGE_BENCHMARKS.md) for Edge before changing a strategy
+or sampler.
 
 ## 1. Setup
 
@@ -23,7 +22,9 @@ IsaacSim remain in their own environment or container.
 
 ## 2. Download A Prebuilt Bundle
 
-The prebuilt Hugging Face bundles are the shortest deployment path:
+The prebuilt Hugging Face bundles are the shortest deployment path.
+
+### Cosmos3 Nano
 
 | Model                                                                                         | Strategy        | Validated role              |
 | --------------------------------------------------------------------------------------------- | --------------- | --------------------------- |
@@ -40,6 +41,24 @@ hf download "XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W8A16" \
 
 Continue with validation below. The bundle is self-contained; the NVIDIA BF16
 checkpoint and DROID calibration data are not deployment dependencies.
+
+### Cosmos3 Edge
+
+| Model                                                                                         | Strategy        | Validated role                    |
+| --------------------------------------------------------------------------------------------- | --------------- | --------------------------------- |
+| [`W8A16`](https://huggingface.co/XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W8A16)               | `full_w8`       | General default; calibration-free |
+| [`W4A16`](https://huggingface.co/XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W4A16)               | `full_w4`       | Minimum steady model allocation   |
+| [`W4A16-AttnW8`](https://huggingface.co/XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W4A16-AttnW8) | `attention_w8`  | Verified on Banana                |
+| [`W4A16-GenW8`](https://huggingface.co/XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W4A16-GenW8)   | `gen_branch_w8` | Highest observed Banana SR        |
+
+```bash
+hf download "XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W8A16" \
+  --local-dir /data/cosmos3_quant/edge_full_w8
+```
+
+Use guidance 3 and two denoise steps for the validated accelerated sampler.
+See [EDGE_BENCHMARKS.md](EDGE_BENCHMARKS.md) for the complete paired matrix and
+scope of each recommendation.
 
 ### Build From The Public Policy
 
@@ -80,8 +99,10 @@ BUNDLE_DIR=/path/to/robolab_full_w8 STRATEGY=full_w8 \
 examples/robolab_quant/pipeline.sh validate
 ```
 
-This CPU-only command verifies all hashes, opens all 504 packed payloads, and
-checks the strategy precision map. Serving a completed bundle never reads the
+This CPU-only command verifies all hashes, opens every packed payload, and
+checks the strategy precision map. Nano bundles contain 504 payloads and Edge
+bundles contain 336; the count is read from the manifest. Serving a completed
+bundle never reads the
 source checkpoint or calibration dataset.
 
 ## 4. Replay
@@ -125,7 +146,7 @@ gripper state, and task text; responses contain a 32x8 action chunk.
 
 ## Strategy Selection
 
-| Strategy        | W4/W8 modules | Peak reserved | Deployment role                             |
+| Nano strategy   | W4/W8 modules | Peak reserved | Deployment role                             |
 | --------------- | ------------: | ------------: | ------------------------------------------- |
 | `full_w8`       |         0/504 |       21.42GB | General default                             |
 | `attention_w8`  |       216/288 |       16.21GB | Banana-only low-memory option at g3/s4      |
@@ -135,6 +156,23 @@ gripper state, and task text; responses contain a 32x8 action chunk.
 Use `full_w8`, guidance 3.0, two steps for general RoboLab deployment. It
 reached 45/50 on Banana and 25/30 across three additional task sets. Do not
 promote a mixed strategy to another task without paired rollout validation.
+
+Build Edge directly from NVIDIA's public 4B DROID policy with the same entry
+point:
+
+```bash
+HF_TOKEN=... \
+MODEL_FAMILY=cosmos3_edge \
+ASSET_DIR=/data/cosmos3_quant/edge_sources \
+BUNDLE_DIR=/data/cosmos3_quant/edge_full_w8 \
+STRATEGY=full_w8 \
+POLICY_GPU=0 \
+examples/robolab_quant/pipeline.sh build-public
+```
+
+The Edge source contains its own processor and vision tower. The pipeline
+copies both into the bundle, validates the local vision weights, and uses the
+same model-agnostic RoboLab OpenPI client as Nano.
 
 ## DROID Training Calibration
 

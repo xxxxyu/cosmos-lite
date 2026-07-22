@@ -22,6 +22,15 @@ illustrative; benchmark success rates use all 50 paired rollouts.
 The BF16 panel is an upstream visual reference and is not included in the
 paired quantization statistics.
 
+## RoboLab Edge Comparison
+
+`robolab_edge_quant_comparison.mp4` compares BF16 and the same four quantized
+strategies using guidance 3 and two denoise steps. Every panel uses three
+episodes selected from its 50 paired runs: the fastest three successes, except
+W4A16, which shows its fastest two successes and one failure. Unlike the Nano
+video, the BF16 panel is replayed from this evaluation's own closed-loop run.
+The MP4 begins with a one-second static cover for GitHub previews.
+
 ## RoboCasa365 Reference
 
 `robocasa_closefridge_bf16_reference.mp4` contains the three fastest successful

@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: Copyright (c) 2026 Xiangyu Li.
 SPDX-License-Identifier: OpenMDW-1.1
 -->
 
-# RoboLab Quantization and Inference Benchmarks
+# Cosmos3 Nano RoboLab Benchmarks
 
 This is the deployment-oriented benchmark record for Cosmos3 Nano Policy DROID
 on RTX 4090. It separates open-loop diagnostics from closed-loop task success.

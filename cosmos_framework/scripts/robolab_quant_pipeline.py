@@ -19,6 +19,8 @@ from cosmos_framework.scripts.robolab_quant_bundle import (
 
 _DROID_REPOSITORY = "nvidia/Cosmos3-Nano-Policy-DROID"
 _DROID_REVISION = "6706d7680581c255ff61e0f3bb49d90eac55c79e"
+_EDGE_DROID_REPOSITORY = "nvidia/Cosmos3-Edge-Policy-DROID"
+_EDGE_DROID_REVISION = "3ea407af3e156c0af3b4bb6edd85842cc9a58777"
 _QWEN_REPOSITORY = "Qwen/Qwen3-VL-8B-Instruct"
 _QWEN_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 _WAN_REPOSITORY = "Wan-AI/Wan2.2-TI2V-5B"
@@ -28,6 +30,7 @@ _WAN_REVISION = "921dbaf3f1674a56f47e83fb80a34bac8a8f203e"
 def _prepare_public_sources(
     asset_dir: str | Path,
     *,
+    model_family: str = "cosmos3_nano",
     droid_revision: str,
     qwen_revision: str,
     wan_revision: str,
@@ -36,39 +39,53 @@ def _prepare_public_sources(
 
     root = Path(asset_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir = root / "Cosmos3-Nano-Policy-DROID"
+    if model_family not in {"cosmos3_nano", "cosmos3_edge"}:
+        raise ValueError(f"Unsupported model family: {model_family}")
+    is_edge = model_family == "cosmos3_edge"
+    droid_repository = _EDGE_DROID_REPOSITORY if is_edge else _DROID_REPOSITORY
+    checkpoint_dir = root / ("Cosmos3-Edge-Policy-DROID" if is_edge else "Cosmos3-Nano-Policy-DROID")
     tokenizer_dir = root / "Qwen3-VL-8B-Instruct-tokenizer"
     vae_dir = root / "Wan2.2-TI2V-5B"
 
     snapshot_download(
-        repo_id=_DROID_REPOSITORY,
+        repo_id=droid_repository,
         revision=droid_revision,
         local_dir=checkpoint_dir,
         allow_patterns=[
             "config.json",
+            "chat_template.jinja",
+            "preprocessor_config.json",
+            "processor_config.json",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "video_preprocessor_config.json",
             "model.safetensors.index.json",
             "transformer/*.safetensors",
             "vision_encoder/*.safetensors",
         ],
     )
-    snapshot_download(
-        repo_id=_QWEN_REPOSITORY,
-        revision=qwen_revision,
-        local_dir=tokenizer_dir,
-        allow_patterns=[
-            "README.md",
-            "chat_template.json",
-            "config.json",
-            "generation_config.json",
-            "merges.txt",
-            "model.safetensors.index.json",
-            "preprocessor_config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "video_preprocessor_config.json",
-            "vocab.json",
-        ],
-    )
+    if not is_edge:
+        snapshot_download(
+            repo_id=_QWEN_REPOSITORY,
+            revision=qwen_revision,
+            local_dir=tokenizer_dir,
+            allow_patterns=[
+                "README.md",
+                "chat_template.json",
+                "config.json",
+                "generation_config.json",
+                "merges.txt",
+                "model.safetensors.index.json",
+                "preprocessor_config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "video_preprocessor_config.json",
+                "vocab.json",
+            ],
+        )
+    else:
+        tokenizer_dir = checkpoint_dir
     vae_path = Path(
         hf_hub_download(
             repo_id=_WAN_REPOSITORY,
@@ -80,34 +97,39 @@ def _prepare_public_sources(
 
     api = HfApi()
     resolved_revisions = {
-        "droid": api.model_info(_DROID_REPOSITORY, revision=droid_revision).sha,
-        "qwen": api.model_info(_QWEN_REPOSITORY, revision=qwen_revision).sha,
+        "droid": api.model_info(droid_repository, revision=droid_revision).sha,
         "wan": api.model_info(_WAN_REPOSITORY, revision=wan_revision).sha,
     }
+    if not is_edge:
+        resolved_revisions["qwen"] = api.model_info(_QWEN_REPOSITORY, revision=qwen_revision).sha
+    requested_revisions = {
+        "droid": droid_revision,
+        "wan": wan_revision,
+    }
+    if not is_edge:
+        requested_revisions["qwen"] = qwen_revision
     result = {
         "asset_dir": str(root),
         "checkpoint_dir": str(checkpoint_dir),
         "tokenizer_dir": str(tokenizer_dir),
         "vae_path": str(vae_path),
         "repositories": {
-            "droid": _DROID_REPOSITORY,
-            "qwen": _QWEN_REPOSITORY,
+            "droid": droid_repository,
             "wan": _WAN_REPOSITORY,
         },
-        "requested_revisions": {
-            "droid": droid_revision,
-            "qwen": qwen_revision,
-            "wan": wan_revision,
-        },
+        "requested_revisions": requested_revisions,
         "resolved_revisions": resolved_revisions,
     }
+    if not is_edge:
+        result["repositories"]["qwen"] = _QWEN_REPOSITORY
     (root / "sources.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return result
 
 
 def _add_public_source_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--asset-dir", required=True)
-    parser.add_argument("--droid-revision", default=_DROID_REVISION)
+    parser.add_argument("--model-family", choices=("cosmos3_nano", "cosmos3_edge"), default="cosmos3_nano")
+    parser.add_argument("--droid-revision")
     parser.add_argument("--qwen-revision", default=_QWEN_REVISION)
     parser.add_argument("--wan-revision", default=_WAN_REVISION)
 
@@ -188,16 +210,24 @@ def main() -> None:
         )
         result.pop("manifest", None)
     elif args.command == "prepare-sources":
+        droid_revision = args.droid_revision or (
+            _EDGE_DROID_REVISION if args.model_family == "cosmos3_edge" else _DROID_REVISION
+        )
         result = _prepare_public_sources(
             args.asset_dir,
-            droid_revision=args.droid_revision,
+            model_family=args.model_family,
+            droid_revision=droid_revision,
             qwen_revision=args.qwen_revision,
             wan_revision=args.wan_revision,
         )
     elif args.command == "build-public":
+        droid_revision = args.droid_revision or (
+            _EDGE_DROID_REVISION if args.model_family == "cosmos3_edge" else _DROID_REVISION
+        )
         sources = _prepare_public_sources(
             args.asset_dir,
-            droid_revision=args.droid_revision,
+            model_family=args.model_family,
+            droid_revision=droid_revision,
             qwen_revision=args.qwen_revision,
             wan_revision=args.wan_revision,
         )

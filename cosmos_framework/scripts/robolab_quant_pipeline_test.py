@@ -10,14 +10,17 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from cosmos_framework.scripts.robolab_quant_pipeline import _DROID_REVISION, _prepare_public_sources
+from cosmos_framework.scripts.robolab_quant_pipeline import (
+    _DROID_REVISION,
+    _EDGE_DROID_REPOSITORY,
+    _EDGE_DROID_REVISION,
+    _prepare_public_sources,
+)
 
 pytestmark = [pytest.mark.L0, pytest.mark.CPU]
 
 
-def test_prepare_public_sources_records_resolved_revisions(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_prepare_public_sources_records_resolved_revisions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     calls: list[dict[str, object]] = []
 
     def snapshot_download(**kwargs: object) -> str:
@@ -55,3 +58,45 @@ def test_prepare_public_sources_records_resolved_revisions(
     assert result["resolved_revisions"]["qwen"].endswith("-qwen-rev")
     assert Path(result["vae_path"]).read_bytes() == b"vae"
     assert json.loads((tmp_path / "sources.json").read_text()) == result
+
+
+def test_prepare_edge_public_sources_reuses_bundled_processor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    def snapshot_download(**kwargs: object) -> str:
+        calls.append(dict(kwargs))
+        local_dir = Path(str(kwargs["local_dir"]))
+        local_dir.mkdir(parents=True, exist_ok=True)
+        return str(local_dir)
+
+    def hf_hub_download(**kwargs: object) -> str:
+        calls.append(dict(kwargs))
+        path = Path(str(kwargs["local_dir"])) / str(kwargs["filename"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"vae")
+        return str(path)
+
+    class FakeHfApi:
+        def model_info(self, repo_id: str, revision: str) -> SimpleNamespace:
+            return SimpleNamespace(sha=f"resolved-{repo_id}-{revision}")
+
+    fake_hub = ModuleType("huggingface_hub")
+    fake_hub.HfApi = FakeHfApi
+    fake_hub.hf_hub_download = hf_hub_download
+    fake_hub.snapshot_download = snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    result = _prepare_public_sources(
+        tmp_path,
+        model_family="cosmos3_edge",
+        droid_revision=_EDGE_DROID_REVISION,
+        qwen_revision="unused-qwen-rev",
+        wan_revision="wan-rev",
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["repo_id"] == _EDGE_DROID_REPOSITORY
+    assert "qwen" not in result["repositories"]
+    assert "qwen" not in result["requested_revisions"]
+    assert "qwen" not in result["resolved_revisions"]
+    assert result["checkpoint_dir"] == result["tokenizer_dir"]

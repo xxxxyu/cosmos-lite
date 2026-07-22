@@ -412,8 +412,7 @@ requires-dist = [
     { name = "botocore", marker = "extra == 'train'" },
     { name = "cattrs" },
     { name = "datasets", marker = "extra == 'train'" },
-    { name = "diffusers" },
-    { name = "diffusers-cosmos3", marker = "extra == 'train'", editable = "../../packages/diffusers-cosmos3" },
+    { name = "diffusers", specifier = ">=0.39.0" },
     { name = "dists-pytorch", marker = "extra == 'train'" },
     { name = "einops" },
     { name = "einx", marker = "extra == 'train'" },
@@ -658,7 +657,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "cosmos-framework" },
-    { name = "diffusers-cosmos3" },
     { name = "filelock" },
     { name = "flash-attn" },
     { name = "iopath" },
@@ -666,6 +664,7 @@ dependencies = [
     { name = "openpi-client" },
     { name = "openpi-server" },
     { name = "pyzmq" },
+    { name = "qwen-vl-utils" },
     { name = "safetensors" },
     { name = "torch" },
     { name = "transformers-cosmos3" },
@@ -682,7 +681,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cosmos-framework", editable = "../../" },
-    { name = "diffusers-cosmos3", editable = "../../packages/diffusers-cosmos3" },
     { name = "filelock", specifier = ">=3.27.0" },
     { name = "flash-attn", specifier = "==2.7.4.post1+cu128.torch210", index = "https://nvidia-cosmos.github.io/cosmos-dependencies/v1.5.0" },
     { name = "iopath", specifier = ">=0.1.10" },
@@ -690,6 +688,7 @@ requires-dist = [
     { name = "openpi-client", specifier = "==0.1.2" },
     { name = "openpi-server", specifier = "==0.1.0" },
     { name = "pyzmq" },
+    { name = "qwen-vl-utils", specifier = "==0.0.14" },
     { name = "safetensors" },
     { name = "torch", specifier = "==2.10.0+cu128", index = "https://download.pytorch.org/whl/cu128" },
     { name = "transformers-cosmos3", editable = "../../packages/transformers-cosmos3" },
@@ -814,17 +813,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/1a/81/6095237b86a3116c4
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3f/3f/7469c46e9d22307ea686bab687d70e6bf328722952f9d10339f5e913e608/diffusers-0.39.0-py3-none-any.whl", hash = "sha256:912aca51b5787365110806e984d5555735bf8a461073bb8459029d0bca7870ef", size = 5631176, upload-time = "2026-07-03T08:48:45.337Z" },
 ]
-
-[[package]]
-name = "diffusers-cosmos3"
-version = "0.1.0"
-source = { editable = "../../packages/diffusers-cosmos3" }
-dependencies = [
-    { name = "diffusers" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "diffusers", specifier = ">=0.37.0" }]
 
 [[package]]
 name = "dill"
@@ -2763,6 +2751,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/01/17/890875f88f4d7da28faec9e6cf0a0cc565715b01474e50501fafc5bc71b4/quack_kernels-0.6.1.tar.gz", hash = "sha256:a694f89c91d137478de523c0227365a331ac9cb66790cfb08baa3dbfaafc71e7", size = 387353, upload-time = "2026-07-05T11:50:19.807Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2b/65/a38a30a6ac96a757363a5be9d09cef799640bb143a64ba5a2f4d400d95d9/quack_kernels-0.6.1-py3-none-any.whl", hash = "sha256:266705ea82117e9b1c8a9e44d68a458519f2498d966c0efffd6812120c3995ad", size = 358439, upload-time = "2026-07-05T11:50:18.502Z" },
+]
+
+[[package]]
+name = "qwen-vl-utils"
+version = "0.0.14"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "av" },
+    { name = "packaging" },
+    { name = "pillow" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b6/b1/ad4fc2260a3badd278b38d642f3b987412f1f6682f0ef2b31b0572d5caa8/qwen_vl_utils-0.0.14.tar.gz", hash = "sha256:9c7cad5ae803b3a10f8bb7194deb12aeacdd032f92f4224e880c73587a7346ad", size = 8453, upload-time = "2025-09-23T09:38:57.532Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/43/80f67e0336cb2fc725f8e06f7fe35c1d0fe946f4d2b8b2175e797e07349e/qwen_vl_utils-0.0.14-py3-none-any.whl", hash = "sha256:5e28657bfd031e56bd447c5901b58ddfc3835285ed100f4c56580e0ade054e96", size = 8120, upload-time = "2025-09-23T09:38:56.297Z" },
 ]
 
 [[package]]

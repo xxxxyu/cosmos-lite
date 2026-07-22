@@ -22,6 +22,8 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from cosmos_framework.scripts._export_model_helpers import build_vision_encoder_bundle_config
+
 logger = logging.getLogger(__name__)
 
 ROBOLAB_BUNDLE_SCHEMA_VERSION = 1
@@ -29,6 +31,19 @@ ROBOLAB_BUNDLE_ARTIFACT_TYPE = "cosmos3_robolab_quantized_policy"
 ROBOLAB_BUNDLE_ROOT_TOKEN = "__COSMOS3_ROBOLAB_QUANT_BUNDLE_ROOT__"
 
 StrategyName = Literal["full_w8", "full_w4", "attention_w8", "gen_branch_w8"]
+ModelFamily = Literal["cosmos3_nano", "cosmos3_edge"]
+
+_QUANT_MODULE_PREFIX = "net.language_model.model.layers."
+_EDGE_PROCESSOR_FILES = (
+    "chat_template.jinja",
+    "config.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "video_preprocessor_config.json",
+)
 
 _LINEAR_WEIGHT_RE = re.compile(
     r"^layers\.(?P<layer>\d+)\."
@@ -37,6 +52,17 @@ _LINEAR_WEIGHT_RE = re.compile(
     r"|self_attn\.(?P<attn>to_q|to_k|to_v|to_out|add_q_proj|add_k_proj|add_v_proj|to_add_out)"
     r")\.weight$"
 )
+
+_ATTENTION_MODULE_NAMES = {
+    "to_q": "q_proj",
+    "to_k": "k_proj",
+    "to_v": "v_proj",
+    "to_out": "o_proj",
+    "add_q_proj": "q_proj_moe_gen",
+    "add_k_proj": "k_proj_moe_gen",
+    "add_v_proj": "v_proj_moe_gen",
+    "to_add_out": "o_proj_moe_gen",
+}
 
 
 @dataclass(frozen=True)
@@ -85,16 +111,36 @@ def _copy_tree(source: Path, target: Path, *, copy_mode: str) -> list[Path]:
 
 
 def _read_weight_map(source_root: Path) -> dict[str, str]:
-    index_path = source_root / "model.safetensors.index.json"
-    data = json.loads(index_path.read_text(encoding="utf-8"))
-    weight_map = data.get("weight_map")
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise ValueError(f"Missing Diffusers weight_map in {index_path}")
-    result = {str(key): str(value) for key, value in weight_map.items()}
+    def read_index(path: Path) -> dict[str, str]:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        weight_map = data.get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise ValueError(f"Missing Diffusers weight_map in {path}")
+        if not all(isinstance(key, str) and isinstance(value, str) for key, value in weight_map.items()):
+            raise TypeError(f"Diffusers weight_map must contain string keys and values: {path}")
+        return dict(weight_map)
+
+    root_index = source_root / "model.safetensors.index.json"
+    result = read_index(root_index) if root_index.is_file() else {}
+    result = {key: value for key, value in result.items() if ".k_norm_und_for_gen." not in key}
+    transformer_index = source_root / "transformer/diffusion_pytorch_model.safetensors.index.json"
+    if transformer_index.is_file():
+        for key, rel_path in read_index(transformer_index).items():
+            result.setdefault(key, f"transformer/{rel_path}")
+    if not result:
+        raise FileNotFoundError(f"No Diffusers safetensors index found under {source_root}")
     missing = sorted({rel for rel in result.values() if not (source_root / rel).is_file()})
     if missing:
         raise FileNotFoundError(f"Source checkpoint is missing indexed shard(s): {missing[:8]}")
     return result
+
+
+def _quant_module_name(source_key: str) -> str:
+    stem = source_key.removesuffix(".weight")
+    prefix, separator, attention_name = stem.rpartition(".self_attn.")
+    if separator:
+        stem = f"{prefix}.self_attn.{_ATTENTION_MODULE_NAMES[attention_name]}"
+    return f"net.language_model.model.{stem}"
 
 
 def _strategy_backend(strategy: StrategyName, source_key: str) -> tuple[str, int] | None:
@@ -106,11 +152,7 @@ def _strategy_backend(strategy: StrategyName, source_key: str) -> tuple[str, int
     if strategy == "full_w4":
         return "VllmGptqMarlinW4A16Linear", 4
     if strategy == "attention_w8":
-        return (
-            ("VllmGptqMarlinW8A16Linear", 8)
-            if match.group("attn") is not None
-            else ("VllmGptqMarlinW4A16Linear", 4)
-        )
+        return ("VllmGptqMarlinW8A16Linear", 8) if match.group("attn") is not None else ("VllmGptqMarlinW4A16Linear", 4)
     if strategy == "gen_branch_w8":
         is_generation = match.group("mlp") == "mlp_moe_gen" or match.group("attn") in {
             "add_q_proj",
@@ -118,41 +160,81 @@ def _strategy_backend(strategy: StrategyName, source_key: str) -> tuple[str, int
             "add_v_proj",
             "to_add_out",
         }
-        return (
-            ("VllmGptqMarlinW8A16Linear", 8)
-            if is_generation
-            else ("VllmGptqMarlinW4A16Linear", 4)
-        )
+        return ("VllmGptqMarlinW8A16Linear", 8) if is_generation else ("VllmGptqMarlinW4A16Linear", 4)
     raise ValueError(f"Unsupported RoboLab quantization strategy: {strategy}")
+
+
+def detect_model_family(source_root: str | Path) -> ModelFamily:
+    root = Path(source_root).expanduser().resolve()
+    config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    model_config = config.get("model", {}).get("config", {})
+    model_name = str(model_config.get("vlm_config", {}).get("model_name", ""))
+    transformer_layers = (model_config.get("net") or {}).get("num_hidden_layers")
+    if "Cosmos3-Edge" in model_name or transformer_layers == 28:
+        return "cosmos3_edge"
+    return "cosmos3_nano"
+
+
+def _manifest_source(
+    *,
+    source_root: Path,
+    processor_source: Path,
+    vae_source: Path,
+    model_family: ModelFamily,
+    provenance: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not provenance:
+        return {
+            "checkpoint_path": source_root.name,
+            "tokenizer_dir": processor_source.name,
+            "vae_path": vae_source.name,
+            "provenance": {},
+        }
+
+    repositories = provenance.get("repositories") or {}
+    revisions = provenance.get("resolved_revisions") or {}
+    droid_uri = f"hf://{repositories['droid']}@{revisions['droid']}"
+    processor_uri = droid_uri if model_family == "cosmos3_edge" else f"hf://{repositories['qwen']}@{revisions['qwen']}"
+    return {
+        "checkpoint_path": droid_uri,
+        "tokenizer_dir": processor_uri,
+        "vae_path": f"hf://{repositories['wan']}@{revisions['wan']}/{vae_source.name}",
+        "provenance": provenance,
+    }
 
 
 def discover_quant_targets(source_root: str | Path, strategy: StrategyName) -> list[QuantTarget]:
     """Map Diffusers Linear weights to the native OmniMoT module hierarchy."""
 
-    from cosmos_framework.inference.model import _diffusers_to_net_key
-
     root = Path(source_root).expanduser().resolve()
+    model_family = detect_model_family(root)
     targets: list[QuantTarget] = []
     for source_key, rel_path in sorted(_read_weight_map(root).items()):
         backend = _strategy_backend(strategy, source_key)
         if backend is None:
             continue
-        net_key = _diffusers_to_net_key(source_key, rel_path)
-        if net_key is None or not net_key.endswith(".weight"):
-            raise KeyError(f"Quantized Diffusers key has no native model mapping: {source_key!r}")
         backend_class, num_bits = backend
         targets.append(
             QuantTarget(
                 source_key=source_key,
-                module_name=f"net.{net_key.removesuffix('.weight')}",
+                module_name=_quant_module_name(source_key),
                 backend_class=backend_class,
                 num_bits=num_bits,
             )
         )
-    if len(targets) != 504:
-        raise ValueError(f"Expected 504 DROID language/MoT Linear targets, found {len(targets)}")
+    expected_targets = 336 if model_family == "cosmos3_edge" else 504
+    if len(targets) != expected_targets:
+        raise ValueError(
+            f"Expected {expected_targets} {model_family} DROID language/MoT Linear targets, found {len(targets)}"
+        )
     if len({target.module_name for target in targets}) != len(targets):
         raise ValueError("Multiple Diffusers weights map to the same quantized module")
+    layers = [int(target.module_name.split(".layers.", 1)[1].split(".", 1)[0]) for target in targets]
+    if sorted(set(layers)) != list(range(max(layers) + 1)):
+        raise ValueError("Quantized DROID layers must be contiguous and zero-indexed")
+    per_layer = {layer: layers.count(layer) for layer in set(layers)}
+    if len(set(per_layer.values())) != 1:
+        raise ValueError(f"Quantized DROID target count differs by layer: {per_layer}")
     return targets
 
 
@@ -194,7 +276,8 @@ def _portable_runtime_config(
     target: Path,
     *,
     source_checkpoint: Path,
-    tokenizer_dir: Path,
+    processor_dir: Path,
+    processor_asset_path: str,
     vae_path: Path,
 ) -> None:
     config = json.loads(source_config.read_text(encoding="utf-8"))
@@ -206,7 +289,7 @@ def _portable_runtime_config(
     tokenizer_config.pop("repository", None)
     tokenizer_config.pop("revision", None)
     tokenizer_config.pop("subdir", None)
-    tokenizer_config["tokenizer_type"] = f"{ROBOLAB_BUNDLE_ROOT_TOKEN}/assets/qwen3_vl_tokenizer"
+    tokenizer_config["tokenizer_type"] = f"{ROBOLAB_BUNDLE_ROOT_TOKEN}/{processor_asset_path}"
     pretrained = model_config["vlm_config"].get("pretrained_weights")
     if isinstance(pretrained, dict):
         pretrained["enabled"] = False
@@ -216,7 +299,7 @@ def _portable_runtime_config(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     text = target.read_text(encoding="utf-8")
-    for forbidden in (str(source_checkpoint), str(tokenizer_dir), str(vae_path)):
+    for forbidden in (str(source_checkpoint), str(processor_dir), str(vae_path)):
         if forbidden and forbidden in text:
             raise ValueError(f"Portable runtime config retained an export-time path: {forbidden}")
 
@@ -279,6 +362,7 @@ def build_robolab_quant_bundle(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to pack Marlin weights")
 
+    model_family = detect_model_family(source_root)
     targets = discover_quant_targets(source_root, strategy)
     target_by_source = {target.source_key: target for target in targets}
     stats = _load_calibration_stats(calibration_stats)
@@ -313,6 +397,8 @@ def build_robolab_quant_bundle(
 
     try:
         for rel_path, source_keys in sorted(source_by_shard.items()):
+            if model_family == "cosmos3_edge" and rel_path == "vision_encoder/model.safetensors":
+                continue
             logger.info(
                 "Packing source shard %s (%d source tensors; %d/%d modules complete)",
                 rel_path,
@@ -398,7 +484,7 @@ def build_robolab_quant_bundle(
                 residual_weight_map[key] = shard_name
             residual_total_size += shard_size
 
-        if len(modules) != 504:
+        if len(modules) != len(targets):
             raise ValueError(f"Packed module count changed during export: {len(modules)}")
 
         residual_index = {
@@ -414,18 +500,48 @@ def build_robolab_quant_bundle(
             source_config,
             runtime_config,
             source_checkpoint=source_root,
-            tokenizer_dir=tokenizer_source,
+            processor_dir=tokenizer_source,
+            processor_asset_path=(
+                "assets/cosmos3_edge_processor" if model_family == "cosmos3_edge" else "assets/qwen3_vl_tokenizer"
+            ),
             vae_path=vae_source,
         )
         files[runtime_config.relative_to(temp_root).as_posix()] = _file_record(runtime_config)
 
-        logger.info("Copying tokenizer and Wan VAE into the deployment bundle")
-        tokenizer_target = temp_root / "assets/qwen3_vl_tokenizer"
-        for path in _copy_tree(tokenizer_source, tokenizer_target, copy_mode=copy_mode):
-            files[path.relative_to(temp_root).as_posix()] = _file_record(path)
+        logger.info("Copying processor and Wan VAE into the deployment bundle")
+        processor_asset_path = (
+            "assets/cosmos3_edge_processor" if model_family == "cosmos3_edge" else "assets/qwen3_vl_tokenizer"
+        )
+        tokenizer_target = temp_root / processor_asset_path
+        if model_family == "cosmos3_edge":
+            for name in _EDGE_PROCESSOR_FILES:
+                source = tokenizer_source / name
+                if not source.is_file():
+                    raise FileNotFoundError(f"Required Cosmos3 Edge processor file is missing: {source}")
+                target = tokenizer_target / name
+                _copy_file(source, target, copy_mode=copy_mode)
+                files[target.relative_to(temp_root).as_posix()] = _file_record(target)
+        else:
+            for path in _copy_tree(tokenizer_source, tokenizer_target, copy_mode=copy_mode):
+                files[path.relative_to(temp_root).as_posix()] = _file_record(path)
         vae_target = temp_root / "assets/Wan2.2_VAE.pth"
         _copy_file(vae_source, vae_target, copy_mode=copy_mode)
         files[vae_target.relative_to(temp_root).as_posix()] = _file_record(vae_target)
+        if model_family == "cosmos3_edge":
+            vision_weights = temp_root / "vision_encoder/model.safetensors"
+            _copy_file(
+                source_root / "vision_encoder/model.safetensors",
+                vision_weights,
+                copy_mode=copy_mode,
+            )
+            files[vision_weights.relative_to(temp_root).as_posix()] = _file_record(vision_weights)
+            vision_config = temp_root / "vision_encoder/config.json"
+            merged_vision_config = build_vision_encoder_bundle_config(source_root / "vision_encoder", source_root)
+            vision_config.write_text(
+                json.dumps(merged_vision_config, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            files[vision_config.relative_to(temp_root).as_posix()] = _file_record(vision_config)
 
         hf_config = temp_root / "config.json"
         hf_config.write_text(
@@ -451,31 +567,36 @@ def build_robolab_quant_bundle(
             "schema_version": ROBOLAB_BUNDLE_SCHEMA_VERSION,
             "artifact_type": ROBOLAB_BUNDLE_ARTIFACT_TYPE,
             "self_contained": True,
+            "model_family": model_family,
             "created_unix": time.time(),
-            "source": {
-                "checkpoint_path": str(source_root),
-                "tokenizer_dir": str(tokenizer_source),
-                "vae_path": str(vae_source),
-                "provenance": source_provenance or {},
-            },
+            "source": _manifest_source(
+                source_root=source_root,
+                processor_source=tokenizer_source,
+                vae_source=vae_source,
+                model_family=model_family,
+                provenance=source_provenance,
+            ),
             "quantization": {
                 "strategy": strategy,
                 "weight_only": True,
                 "activation_quantization": False,
                 "w4_modules": counts["w4"],
                 "w8_modules": counts["w8"],
-                "calibration_stats": str(Path(calibration_stats).expanduser()) if calibration_stats else "",
+                "calibration_stats": Path(calibration_stats).name if calibration_stats else "",
+                "calibration_stats_sha256": _sha256(Path(calibration_stats).expanduser()) if calibration_stats else "",
                 "calibration_alpha": calibration_alpha,
                 "uncalibrated_w4": bool(missing_stats),
             },
             "runtime": {
                 "config_file": "runtime/config.json",
-                "tokenizer_dir": "assets/qwen3_vl_tokenizer",
+                "tokenizer_dir": processor_asset_path,
                 "vae_path": "assets/Wan2.2_VAE.pth",
                 "residual_index": "model.safetensors.index.json",
+                "vision_encoder_dir": "vision_encoder" if model_family == "cosmos3_edge" else "",
             },
             "model": {
                 "quant_module_count": len(modules),
+                "quant_module_prefix": _QUANT_MODULE_PREFIX,
                 "residual_state_key_count": len(residual_weight_map),
                 "residual_total_size": residual_total_size,
                 "residual_shard_count": residual_shard_index,
@@ -524,15 +645,22 @@ def validate_robolab_quant_bundle(
     strategy = str(quantization.get("strategy", ""))
     if expected_strategy is not None and strategy != expected_strategy:
         raise ValueError(f"Expected strategy {expected_strategy!r}, found {strategy!r}")
+    model = manifest.get("model") or {}
+    if not isinstance(model, dict):
+        raise ValueError("RoboLab quant bundle model metadata must be a dictionary")
+    expected_modules = int(model.get("quant_module_count", 504))
+    module_prefix = str(model.get("quant_module_prefix", _QUANT_MODULE_PREFIX))
     modules = manifest.get("modules")
-    if not isinstance(modules, list) or len(modules) != 504:
-        raise ValueError(f"RoboLab quant bundle must contain 504 packed modules, found {len(modules or [])}")
+    if not isinstance(modules, list) or len(modules) != expected_modules:
+        raise ValueError(
+            f"RoboLab quant bundle must contain {expected_modules} packed modules, found {len(modules or [])}"
+        )
     names: set[str] = set()
     for entry in modules:
         if not isinstance(entry, dict):
             raise TypeError("RoboLab quant module metadata must be dictionaries")
         name = str(entry.get("name", ""))
-        if not name.startswith("net.language_model.model.layers.") or name in names:
+        if not name.startswith(module_prefix) or name in names:
             raise ValueError(f"Invalid or duplicate quant module name: {name!r}")
         names.add(name)
         num_bits = int(entry.get("num_bits", 0))
@@ -554,6 +682,12 @@ def validate_robolab_quant_bundle(
         rel = Path(str(runtime.get(field, "")))
         if rel.is_absolute() or ".." in rel.parts or not (root / rel).exists():
             raise ValueError(f"Invalid runtime path {field}: {rel}")
+    vision_encoder_dir = str(runtime.get("vision_encoder_dir", ""))
+    if vision_encoder_dir:
+        rel = Path(vision_encoder_dir)
+        vision_weights = root / rel / "model.safetensors"
+        if rel.is_absolute() or ".." in rel.parts or not vision_weights.is_file():
+            raise ValueError(f"Invalid runtime path vision_encoder_dir: {rel}")
     runtime_text = (root / str(runtime["config_file"])).read_text(encoding="utf-8")
     if ROBOLAB_BUNDLE_ROOT_TOKEN not in runtime_text:
         raise ValueError("Portable runtime config has no bundle-root token")

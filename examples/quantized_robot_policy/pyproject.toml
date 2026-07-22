@@ -5,7 +5,6 @@ description = "Minimal runtime for Cosmos3 packed W4A16/W8A16 robot policies"
 requires-python = ">=3.13,<3.14"
 dependencies = [
   "cosmos-framework",
-  "diffusers-cosmos3",
   "filelock>=3.27.0",
   "flash-attn==2.7.4.post1+cu128.torch210",
   "iopath>=0.1.10",
@@ -13,6 +12,7 @@ dependencies = [
   "openpi-client==0.1.2",
   "openpi-server==0.1.0",
   "pyzmq",
+  "qwen-vl-utils==0.0.14",
   "safetensors",
   "torch==2.10.0+cu128",
   "transformers-cosmos3",
@@ -38,7 +38,6 @@ override-dependencies = [
 
 [tool.uv.sources]
 cosmos-framework = { path = "../..", editable = true }
-diffusers-cosmos3 = { path = "../../packages/diffusers-cosmos3", editable = true }
 flash-attn = { index = "cosmos" }
 natten = { index = "cosmos" }
 torch = { index = "pytorch" }

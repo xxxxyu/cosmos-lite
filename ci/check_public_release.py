@@ -29,7 +29,8 @@ REQUIRED_SPDX_PATHS = (
     "examples/robocasa365_quant/README.md",
     "examples/robocasa365_quant/BENCHMARKS.md",
     "examples/robolab_quant/README.md",
-    "examples/robolab_quant/BENCHMARKS.md",
+    "examples/robolab_quant/NANO_BENCHMARKS.md",
+    "examples/robolab_quant/EDGE_BENCHMARKS.md",
 )
 
 

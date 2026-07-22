@@ -30,9 +30,9 @@ def main() -> None:
             "cosmos_framework",
             "cosmos_framework.model.attention.flash2",
             "cosmos_framework.model.attention.natten",
-            "diffusers_cosmos3",
             "openpi_client",
             "openpi_server",
+            "qwen_vl_utils",
             "transformers_cosmos3",
             "vllm._C",
             "vllm._custom_ops",
@@ -60,7 +60,7 @@ def main() -> None:
         value = getattr(module, "__file__", None)
         module_paths[name] = str(Path(value).resolve()) if value else "<extension>"
     if repo_root is not None:
-        for name in ("cosmos_framework", "diffusers_cosmos3", "transformers_cosmos3", "vllm_cosmos3"):
+        for name in ("cosmos_framework", "transformers_cosmos3", "vllm_cosmos3"):
             path = Path(module_paths[name])
             if not path.is_relative_to(repo_root):
                 raise RuntimeError(f"{name} imported from stale checkout: {path}")

@@ -101,6 +101,7 @@ case "$command_name" in
     args=(
       build-public
       --asset-dir "$ASSET_DIR"
+      --model-family "${MODEL_FAMILY:-cosmos3_nano}"
       --strategy "${STRATEGY:-full_w8}"
       --output-dir "$BUNDLE_DIR"
       --device cuda:0
@@ -190,7 +191,7 @@ Commands:
   rollout       start the server and run a RoboLab task on a separate GPU
 
 Required environment variables by command:
-  build-public: ASSET_DIR, BUNDLE_DIR; optional STRATEGY, CALIBRATION_STATS, POLICY_GPU
+  build-public: ASSET_DIR, BUNDLE_DIR; optional MODEL_FAMILY, STRATEGY, CALIBRATION_STATS, POLICY_GPU
   validate:     BUNDLE_DIR; optional STRATEGY
   serve:        BUNDLE_DIR; optional POLICY_GPU, HOST, PORT, GUIDANCE, NUM_STEPS
   replay:       BUNDLE_DIR, CAPTURE_DIR; optional REPLAY_LIMIT and server variables

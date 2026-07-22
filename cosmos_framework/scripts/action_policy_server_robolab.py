@@ -64,8 +64,7 @@ from cosmos_framework.scripts.robolab_quant_bundle import (
     materialize_robolab_bundle_config,
     validate_robolab_quant_bundle,
 )
-from cosmos_framework.scripts.robolab_quant_runtime import RobolabDirectQuantLoader
-from cosmos_framework.scripts.robolab_quant_runtime import QuantLinearWithOptionalBias
+from cosmos_framework.scripts.robolab_quant_runtime import QuantLinearWithOptionalBias, RobolabDirectQuantLoader
 from cosmos_framework.utils import log
 from cosmos_framework.utils.checkpoint_db import CheckpointDirHf
 from cosmos_framework.utils.lazy_config import instantiate
@@ -222,8 +221,10 @@ def _validate_checkpoint(checkpoint_path: str, *, allow_dcp_checkpoint: bool) ->
     has_config = (checkpoint_dir / "config.json").exists()
     has_consolidated_safetensors = any(checkpoint_dir.glob("*.safetensors"))
     has_diffusers_safetensors_index = (checkpoint_dir / "model.safetensors.index.json").exists()
-    if not checkpoint_dir.is_dir() or not has_config or not (
-        has_consolidated_safetensors or has_diffusers_safetensors_index
+    if (
+        not checkpoint_dir.is_dir()
+        or not has_config
+        or not (has_consolidated_safetensors or has_diffusers_safetensors_index)
     ):
         raise ValueError(f"Invalid safetensors checkpoint directory: {checkpoint_dir}")
 
@@ -517,9 +518,7 @@ class RobolabPolicyService:
         else:
             self._capture_index = 0
         self._calibration_stats_output = (
-            args.calibration_stats_output.expanduser().resolve()
-            if args.calibration_stats_output is not None
-            else None
+            args.calibration_stats_output.expanduser().resolve() if args.calibration_stats_output is not None else None
         )
         self._calibration_stats: dict[str, torch.Tensor] = {}
         self._calibration_hook_handles: list[Any] = []
@@ -559,9 +558,11 @@ class RobolabPolicyService:
             if isinstance(module, QuantLinearWithOptionalBias):
                 name = module.quant_module_name
                 self._calibration_hook_handles.append(module.register_forward_pre_hook(make_hook(name)))
-        if len(self._calibration_hook_handles) != 504:
+        expected_modules = self._quant_loader.validation["modules"] if self._quant_loader is not None else 0
+        if len(self._calibration_hook_handles) != expected_modules:
             raise ValueError(
-                f"Expected calibration hooks for 504 packed Linear modules, found {len(self._calibration_hook_handles)}"
+                f"Expected calibration hooks for {expected_modules} packed Linear modules, "
+                f"found {len(self._calibration_hook_handles)}"
             )
 
     def _flush_calibration_stats(self) -> None:
