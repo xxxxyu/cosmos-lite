@@ -64,6 +64,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+build_compile_args() {
+  compile_args=()
+  if [[ "${TORCH_COMPILE:-0}" == "1" ]]; then
+    compile_args+=(--use-torch-compile --compiled-region "${COMPILED_REGION:-language}")
+    if [[ "${CUDA_GRAPHS:-0}" == "1" ]]; then
+      compile_args+=(--use-cuda-graphs)
+    fi
+    if [[ "${COMPILE_DYNAMIC:-1}" == "1" ]]; then
+      compile_args+=(--compile-dynamic)
+    else
+      compile_args+=(--no-compile-dynamic)
+    fi
+  fi
+}
+
 start_server() {
   require_value BUNDLE_DIR
   local policy_gpu="${POLICY_GPU:-0}"
@@ -71,6 +86,7 @@ start_server() {
   local port="${PORT:-8000}"
   local guidance="${GUIDANCE:-3.0}"
   local num_steps="${NUM_STEPS:-2}"
+  build_compile_args
   RUN_DIR="${RUN_DIR:-$PWD/robolab_quant_run_$(date +%Y%m%d_%H%M%S)}"
   export RUN_DIR
   mkdir -p "$RUN_DIR/server"
@@ -85,6 +101,7 @@ start_server() {
       --deterministic-seed \
       --guidance "$guidance" \
       --num-steps "$num_steps" \
+      "${compile_args[@]}" \
       >"$RUN_DIR/server.log" 2>&1 &
   server_pid=$!
   wait_for_port "$host" "$port" "$server_pid"
@@ -130,6 +147,7 @@ case "$command_name" in
     require_runtime
     require_value BUNDLE_DIR
     require_free_port 127.0.0.1 "${PORT:-8000}"
+    build_compile_args
     exec env CUDA_VISIBLE_DEVICES="${POLICY_GPU:-0}" "$python_bin" -m \
       cosmos_framework.scripts.action_policy_server_robolab \
         --quant-import-dir "$BUNDLE_DIR" \
@@ -139,7 +157,8 @@ case "$command_name" in
         --profile-jsonl "${RUN_DIR:-$PWD/robolab_quant_server}/profile.jsonl" \
         --deterministic-seed \
         --guidance "${GUIDANCE:-3.0}" \
-        --num-steps "${NUM_STEPS:-2}"
+        --num-steps "${NUM_STEPS:-2}" \
+        "${compile_args[@]}"
     ;;
   replay)
     require_runtime
@@ -198,7 +217,8 @@ Commands:
 Required environment variables by command:
   build-public: ASSET_DIR, BUNDLE_DIR; optional MODEL_FAMILY, STRATEGY, CALIBRATION_STATS, POLICY_GPU
   validate:     BUNDLE_DIR; optional STRATEGY
-  serve:        BUNDLE_DIR; optional POLICY_GPU, HOST, PORT, GUIDANCE, NUM_STEPS
+  serve:        BUNDLE_DIR; optional POLICY_GPU, HOST, PORT, GUIDANCE, NUM_STEPS,
+                TORCH_COMPILE, COMPILED_REGION, COMPILE_DYNAMIC, CUDA_GRAPHS
   replay:       BUNDLE_DIR, CAPTURE_DIR; optional REPLAY_LIMIT and server variables
   rollout:      BUNDLE_DIR, ROBOLAB_DIR, ROBOLAB_PYTHON; optional SIM_GPU, TASK,
                 NUM_ENVS, NUM_RUNS, VIDEO_MODE and server variables

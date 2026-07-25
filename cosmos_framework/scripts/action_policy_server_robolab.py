@@ -26,6 +26,7 @@ from cosmos_framework.inference.common.init import init_script
 init_script()
 
 import json
+import os
 import socket
 import threading
 import time
@@ -392,6 +393,12 @@ class RobolabServerArgs(pydantic.BaseModel):
     """Diffusion sampler used by OmniInference."""
     use_torch_compile: bool = False
     """Compile the inference graph. Disabled by default for predictable single-robot latency."""
+    use_cuda_graphs: bool = False
+    """Use Inductor CUDA Graphs inside compiled MoT blocks. Requires --use-torch-compile."""
+    compiled_region: Literal["all", "language"] = "language"
+    """Compile MoT language blocks only, or also compile the VFM encode/decode heads."""
+    compile_dynamic: bool = True
+    """Use symbolic-shape compiled MoT kernels. Required for varying policy prompt lengths."""
 
     seed: int = 0
     """Base generation seed used to initialize the request RNG."""
@@ -430,6 +437,10 @@ class RobolabPolicyService:
     def __init__(self, args: RobolabServerArgs) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for OmniMoTModel inference in this repo.")
+        if args.use_cuda_graphs and not args.use_torch_compile:
+            raise ValueError("--use-cuda-graphs requires --use-torch-compile")
+        if args.use_torch_compile and os.environ.get("COSMOS3_LINEAR_SHAPES_JSONL"):
+            raise ValueError("MoT fullgraph compile is incompatible with COSMOS3_LINEAR_SHAPES_JSONL")
         load_start = time.perf_counter()
         self._profile_jsonl = args.profile_jsonl.expanduser().resolve() if args.profile_jsonl is not None else None
         self._quant_loader: RobolabDirectQuantLoader | None = None
@@ -545,6 +556,10 @@ class RobolabPolicyService:
             num_steps=self.cfg.num_steps,
             action_chunk_size=self.cfg.action_chunk_size,
             vae_encode_chunk_frames=args.vae_encode_chunk_frames,
+            use_torch_compile=args.use_torch_compile,
+            use_cuda_graphs=args.use_cuda_graphs,
+            compiled_region=args.compiled_region,
+            compile_dynamic=args.compile_dynamic,
         )
 
     def _install_calibration_hooks(self) -> None:
@@ -594,6 +609,9 @@ class RobolabPolicyService:
             "sampler": args.sampler,
             "guardrails": args.guardrails,
             "use_torch_compile": args.use_torch_compile,
+            "use_cuda_graphs": args.use_cuda_graphs,
+            "compiled_region": args.compiled_region,
+            "compile_dynamic": args.compile_dynamic,
         }
         if config_file_override is not None:
             setup_overrides["config_file"] = config_file_override

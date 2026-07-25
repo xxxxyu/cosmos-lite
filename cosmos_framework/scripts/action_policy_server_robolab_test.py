@@ -81,6 +81,9 @@ def test_server_args_default_to_released_droid_serving_config() -> None:
     assert args.host == "127.0.0.1"
     assert args.guardrails is False
     assert args.use_torch_compile is False
+    assert args.use_cuda_graphs is False
+    assert args.compiled_region == "language"
+    assert args.compile_dynamic is True
     assert args.vae_encode_chunk_frames == 8
     assert args.hf_revision == "main"
     assert args.domain_name == "droid_lerobot"

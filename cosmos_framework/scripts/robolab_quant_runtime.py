@@ -86,7 +86,8 @@ class QuantLinearWithOptionalBias(nn.Module):
             self.bias = nn.Parameter(bias.detach().to(torch.bfloat16), requires_grad=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _record_quant_linear_shape(self.quant_module_name, self.backend, x)
+        if _LINEAR_SHAPES_JSONL:
+            _record_quant_linear_shape(self.quant_module_name, self.backend, x)
         output = self.backend(x)
         return output if self.bias is None else output + self.bias
 

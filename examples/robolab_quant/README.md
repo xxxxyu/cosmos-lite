@@ -11,9 +11,12 @@ against RoboLab on RTX 4090. See [NANO_BENCHMARKS.md](NANO_BENCHMARKS.md) for
 Nano and [EDGE_BENCHMARKS.md](EDGE_BENCHMARKS.md) for Edge before changing a strategy
 or sampler.
 
-The Ada FP8 W8A8 path is currently tracked as a separate
-[Nano experiment](FP8_W8A8_EXPERIMENT.md); stable recommendations below remain
-W4A16/W8A16 pending release review and bundle distribution.
+The Ada FP8 W8A8 path is tracked in the
+[FP8 experiment](FP8_W8A8_EXPERIMENT.md). Its optional training-free compile
+path and rejected CUDA Graph variants are documented in the
+[graph optimization experiment](GRAPH_OPTIMIZATION_EXPERIMENT.md). Stable
+recommendations below remain W4A16/W8A16 pending release review and bundle
+distribution.
 
 ## 1. Setup
 
