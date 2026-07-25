@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from cosmos_framework.scripts import robolab_quant_bundle as bundle_module
 from cosmos_framework.scripts.robolab_quant_bundle import (
@@ -102,10 +103,12 @@ def test_strategy_precision_maps_match_nano_release_counts() -> None:
         "full_w4": (504, 0),
         "attention_w8": (216, 288),
         "gen_branch_w8": (252, 252),
+        "gen_branch_w8a8": (252, 252),
     }
     for strategy, counts in expected.items():
         bits = [_strategy_backend(strategy, key)[1] for key in keys]  # type: ignore[arg-type, union-attr]
         assert (bits.count(4), bits.count(8)) == counts
+    assert sum(_strategy_backend("gen_branch_w8a8", key)[0] == "VllmCutlassFp8W8A8Linear" for key in keys) == 252
 
 
 def test_strategy_precision_maps_match_edge_release_counts() -> None:
@@ -115,10 +118,12 @@ def test_strategy_precision_maps_match_edge_release_counts() -> None:
         "full_w4": (336, 0),
         "attention_w8": (112, 224),
         "gen_branch_w8": (168, 168),
+        "gen_branch_w8a8": (168, 168),
     }
     for strategy, counts in expected.items():
         bits = [_strategy_backend(strategy, key)[1] for key in keys]  # type: ignore[arg-type, union-attr]
         assert (bits.count(4), bits.count(8)) == counts
+    assert sum(_strategy_backend("gen_branch_w8a8", key)[0] == "VllmCutlassFp8W8A8Linear" for key in keys) == 168
 
 
 def test_public_edge_manifest_uses_revision_uris_without_local_paths(tmp_path: Path) -> None:
@@ -234,6 +239,51 @@ def test_bundle_validation_and_runtime_materialization(tmp_path: Path) -> None:
     text = materialized.read_text()
     assert ROBOLAB_BUNDLE_ROOT_TOKEN not in text
     assert str(bundle.resolve()) in text
+
+
+def test_fp8_bundle_validation_checks_activation_metadata_and_payload(tmp_path: Path) -> None:
+    bundle = tmp_path / "fp8-bundle"
+    _minimal_bundle(bundle)
+    torch.save(
+        {
+            "qweight_nk": torch.zeros(64, 128).to(torch.float8_e4m3fn),
+            "scale_b": torch.ones(1, 64, dtype=torch.float32),
+            "input_scale": None,
+        },
+        bundle / "tensors/shared.pt",
+    )
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["quantization"].update(
+        {
+            "strategy": "gen_branch_w8a8",
+            "weight_only": False,
+            "activation_quantization": True,
+            "activation_dtype": "fp8_e4m3fn",
+            "w8a8_modules": 504,
+            "w8a16_modules": 0,
+        }
+    )
+    for entry in manifest["modules"]:
+        entry.update(
+            {
+                "backend_class": "VllmCutlassFp8W8A8Linear",
+                "format": "vllm_cutlass_fp8_w8a8",
+                "activation_bits": 8,
+            }
+        )
+        entry.pop("group_size")
+        entry.pop("wtype_id")
+    manifest["files"]["tensors/shared.pt"]["size"] = (bundle / "tensors/shared.pt").stat().st_size
+    manifest_path.write_text(json.dumps(manifest))
+
+    result = validate_robolab_quant_bundle(bundle, expected_strategy="gen_branch_w8a8", check_tensors=True)
+    assert result["modules"] == 504
+
+    manifest["quantization"].pop("weight_only")
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="weight_only"):
+        validate_robolab_quant_bundle(bundle)
 
 
 def test_edge_bundle_uses_manifest_module_count_and_local_vision_tower(tmp_path: Path) -> None:

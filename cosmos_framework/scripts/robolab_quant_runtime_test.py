@@ -24,7 +24,7 @@ def test_quant_linear_shape_recorder_groups_calls(monkeypatch: pytest.MonkeyPatc
     runtime._LINEAR_SHAPE_COUNTS.clear()
     runtime._record_quant_linear_shape("net.layers.0.mlp.up_proj", backend, x)
     runtime._record_quant_linear_shape("net.layers.0.mlp.up_proj", backend, x)
-    runtime._flush_quant_linear_shapes()
+    runtime.flush_quant_linear_shapes()
 
     assert json.loads(output.read_text()) == {
         "event": "quant_linear_shape",

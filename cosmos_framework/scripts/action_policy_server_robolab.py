@@ -64,7 +64,11 @@ from cosmos_framework.scripts.robolab_quant_bundle import (
     materialize_robolab_bundle_config,
     validate_robolab_quant_bundle,
 )
-from cosmos_framework.scripts.robolab_quant_runtime import QuantLinearWithOptionalBias, RobolabDirectQuantLoader
+from cosmos_framework.scripts.robolab_quant_runtime import (
+    QuantLinearWithOptionalBias,
+    RobolabDirectQuantLoader,
+    flush_quant_linear_shapes,
+)
 from cosmos_framework.utils import log
 from cosmos_framework.utils.checkpoint_db import CheckpointDirHf
 from cosmos_framework.utils.lazy_config import instantiate
@@ -795,6 +799,7 @@ class RobolabPolicyService:
         )
         self._capture(obs, outputs)
         self._flush_calibration_stats()
+        flush_quant_linear_shapes()
         return outputs
 
 

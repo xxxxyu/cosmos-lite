@@ -23,6 +23,7 @@ def _percentile(values: list[float], percentile: float) -> float | None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-dir", required=True)
+    parser.add_argument("--reference-dir")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -34,6 +35,7 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _parser().parse_args()
     capture_root = Path(args.capture_dir).expanduser().resolve()
+    reference_root = Path(args.reference_dir).expanduser().resolve() if args.reference_dir else capture_root
     output_root = Path(args.output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     request_files = sorted(capture_root.glob("sample_*.request.msgpack"))[args.skip :]
@@ -61,7 +63,7 @@ def main() -> None:
         action = np.asarray(response["action"], dtype=np.float32)
         if not np.isfinite(action).all():
             raise ValueError(f"Non-finite action returned for {request_file.name}")
-        reference_file = request_file.with_name(request_file.name.replace(".request.", ".response."))
+        reference_file = reference_root / request_file.name.replace(".request.", ".response.")
         l1 = None
         linf = None
         if reference_file.is_file():
@@ -90,6 +92,7 @@ def main() -> None:
 
     metrics = {
         "capture_dir": str(capture_root),
+        "reference_dir": str(reference_root) if reference_root != capture_root else None,
         "samples": len(rows),
         "request_ms": {"p50": _percentile(request_ms, 50), "p95": _percentile(request_ms, 95)},
         "server_ms": {"p50": _percentile(server_ms, 50), "p95": _percentile(server_ms, 95)},

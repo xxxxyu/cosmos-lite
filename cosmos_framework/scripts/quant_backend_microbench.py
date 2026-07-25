@@ -320,6 +320,65 @@ class VllmGptqMarlinW8A16Linear(nn.Module):
         return out.reshape(x.shape[:-1] + (self.size_n,)).to(torch.bfloat16)
 
 
+class VllmCutlassFp8W8A8Linear(nn.Module):
+    """CUTLASS FP8 linear with per-channel weights and dynamic per-token activations."""
+
+    def __init__(self, weight: torch.Tensor, input_scale: torch.Tensor | None = None) -> None:
+        super().__init__()
+        if not torch.cuda.is_available() or weight.device.type != "cuda":
+            raise RuntimeError("vLLM CUTLASS FP8 backend requires CUDA tensors")
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("vLLM CUTLASS FP8 backend requires torch.float8_e4m3fn")
+
+        import vllm._C  # noqa: F401  # Registers vLLM CUTLASS and quant kernels.
+        from vllm import _custom_ops as ops
+
+        capability = torch.cuda.get_device_capability(weight.device)
+        capability_int = capability[0] * 10 + capability[1]
+        if capability_int < 89 or not ops.cutlass_scaled_mm_supports_fp8(capability_int):
+            raise RuntimeError(
+                f"vLLM CUTLASS FP8 W8A8 requires native FP8 support (SM89+), got SM{capability_int}"
+            )
+
+        self.size_n, self.size_k = weight.shape
+        self.num_bits = 8
+        self.activation_bits = 8
+        self.fp8_max = 448.0
+        weight_nk = weight.detach().to(torch.bfloat16).contiguous()
+        if input_scale is not None:
+            if input_scale.numel() != self.size_k:
+                raise ValueError(f"input_scale must have {self.size_k} elements, got {input_scale.numel()}")
+            scale = input_scale.detach().to(device=weight.device, dtype=torch.bfloat16).reshape(1, self.size_k)
+            weight_nk = weight_nk * scale
+            self.register_buffer("input_scale", scale.reshape(self.size_k), persistent=False)
+        else:
+            self.input_scale = None
+        scale_b = (weight_nk.abs().amax(dim=1, keepdim=True).float() / self.fp8_max).clamp(min=1e-8)
+        qweight_nk = (weight_nk / scale_b).clamp(-self.fp8_max, self.fp8_max).to(torch.float8_e4m3fn)
+        self.register_buffer("qweight_nk", qweight_nk.contiguous(), persistent=False)
+        self.register_buffer("scale_b", scale_b.reshape(1, self.size_n).contiguous(), persistent=False)
+
+    @staticmethod
+    def _ops():
+        from vllm import _custom_ops as ops
+
+        return ops
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        if self.input_scale is not None:
+            x_2d = (x_2d / self.input_scale).contiguous()
+        q_x, scale_a = self._ops().scaled_fp8_quant(x_2d, use_per_token_if_dynamic=True)
+        out = self._ops().cutlass_scaled_mm(
+            q_x,
+            self.qweight_nk.t(),
+            scale_a,
+            self.scale_b,
+            torch.bfloat16,
+        )
+        return out.reshape(x.shape[:-1] + (self.size_n,)).to(torch.bfloat16)
+
+
 class VllmAllSparkW8A16Linear(nn.Module):
     def __init__(self, weight: torch.Tensor) -> None:
         super().__init__()
@@ -407,6 +466,8 @@ def _make_backend(name: str, weight: torch.Tensor) -> nn.Module:
         return VllmGptqMarlinW4A16Linear(weight)
     if name == "vllm_gptq_marlin_w8a16":
         return VllmGptqMarlinW8A16Linear(weight)
+    if name == "vllm_cutlass_fp8_w8a8":
+        return VllmCutlassFp8W8A8Linear(weight)
     if name == "vllm_allspark_w8a16":
         return VllmAllSparkW8A16Linear(weight)
     raise ValueError(f"Unsupported backend {name!r}")
@@ -678,6 +739,7 @@ def main() -> None:
         "notes": {
             "vllm_gptq_marlin_w4a16": "offline symmetric per-group W4 quantization; forward uses vLLM Marlin ops only",
             "vllm_gptq_marlin_w8a16": "offline symmetric per-channel W8 quantization; forward uses vLLM Marlin ops only",
+            "vllm_cutlass_fp8_w8a8": "offline per-channel FP8 weights and dynamic per-token FP8 activations; requires SM89+",
             "vllm_allspark_w8a16": "offline symmetric per-channel W8 quantization; forward uses vLLM AllSpark ops; gated to 80 <= SM < 90",
             "storage_gb": "module parameter/buffer bytes only; excludes temporary original BF16 tensors held by harness",
         },

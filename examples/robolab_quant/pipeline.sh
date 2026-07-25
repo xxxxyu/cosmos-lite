@@ -145,12 +145,17 @@ case "$command_name" in
     require_runtime
     require_value CAPTURE_DIR
     start_server
-    "$python_bin" -m cosmos_framework.scripts.robolab_policy_replay \
-      --capture-dir "$CAPTURE_DIR" \
-      --output-dir "$RUN_DIR/replay" \
-      --host "${HOST:-127.0.0.1}" \
-      --port "${PORT:-8000}" \
+    replay_args=(
+      --capture-dir "$CAPTURE_DIR"
+      --output-dir "$RUN_DIR/replay"
+      --host "${HOST:-127.0.0.1}"
+      --port "${PORT:-8000}"
       --limit "${REPLAY_LIMIT:-32}"
+    )
+    if [[ -n "${REFERENCE_DIR:-}" ]]; then
+      replay_args+=(--reference-dir "$REFERENCE_DIR")
+    fi
+    "$python_bin" -m cosmos_framework.scripts.robolab_policy_replay "${replay_args[@]}"
     echo "RoboLab replay complete: $RUN_DIR"
     ;;
   rollout)

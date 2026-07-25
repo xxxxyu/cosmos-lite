@@ -30,7 +30,7 @@ ROBOLAB_BUNDLE_SCHEMA_VERSION = 1
 ROBOLAB_BUNDLE_ARTIFACT_TYPE = "cosmos3_robolab_quantized_policy"
 ROBOLAB_BUNDLE_ROOT_TOKEN = "__COSMOS3_ROBOLAB_QUANT_BUNDLE_ROOT__"
 
-StrategyName = Literal["full_w8", "full_w4", "attention_w8", "gen_branch_w8"]
+StrategyName = Literal["full_w8", "full_w4", "attention_w8", "gen_branch_w8", "gen_branch_w8a8"]
 ModelFamily = Literal["cosmos3_nano", "cosmos3_edge"]
 
 _QUANT_MODULE_PREFIX = "net.language_model.model.layers."
@@ -153,14 +153,17 @@ def _strategy_backend(strategy: StrategyName, source_key: str) -> tuple[str, int
         return "VllmGptqMarlinW4A16Linear", 4
     if strategy == "attention_w8":
         return ("VllmGptqMarlinW8A16Linear", 8) if match.group("attn") is not None else ("VllmGptqMarlinW4A16Linear", 4)
-    if strategy == "gen_branch_w8":
+    if strategy in {"gen_branch_w8", "gen_branch_w8a8"}:
         is_generation = match.group("mlp") == "mlp_moe_gen" or match.group("attn") in {
             "add_q_proj",
             "add_k_proj",
             "add_v_proj",
             "to_add_out",
         }
-        return ("VllmGptqMarlinW8A16Linear", 8) if is_generation else ("VllmGptqMarlinW4A16Linear", 4)
+        if is_generation:
+            backend = "VllmCutlassFp8W8A8Linear" if strategy == "gen_branch_w8a8" else "VllmGptqMarlinW8A16Linear"
+            return backend, 8
+        return "VllmGptqMarlinW4A16Linear", 4
     raise ValueError(f"Unsupported RoboLab quantization strategy: {strategy}")
 
 
@@ -416,26 +419,57 @@ def build_robolab_quant_bundle(
                     if target is not None:
                         weight = tensor.to(device=device, dtype=torch.bfloat16)
                         input_scale = None
-                        if target.num_bits == 4 and target.module_name in stats:
+                        if (
+                            target.num_bits == 4 or target.backend_class == "VllmCutlassFp8W8A8Linear"
+                        ) and target.module_name in stats:
                             input_scale = _input_scale(
                                 stats[target.module_name], size_k=int(weight.shape[1]), alpha=calibration_alpha
                             )
-                        if target.num_bits == 8:
+                        if target.backend_class == "VllmCutlassFp8W8A8Linear":
+                            backend = backend_module.VllmCutlassFp8W8A8Linear(weight, input_scale=input_scale)
+                        elif target.num_bits == 8:
                             backend = backend_module.VllmGptqMarlinW8A16Linear(weight)
                         else:
                             backend = backend_module.VllmGptqMarlinW4A16Linear(weight, input_scale=input_scale)
                         torch.cuda.synchronize(device)
-                        payload = {
-                            "backend_class": target.backend_class,
-                            "bias": None,
-                            "qweight": backend.qweight.detach().cpu().contiguous(),
-                            "scales": backend.scales.detach().cpu().contiguous(),
-                            "input_scale": (
-                                backend.input_scale.detach().cpu().contiguous()
-                                if isinstance(getattr(backend, "input_scale", None), torch.Tensor)
-                                else None
-                            ),
-                        }
+                        if target.backend_class == "VllmCutlassFp8W8A8Linear":
+                            payload = {
+                                "backend_class": target.backend_class,
+                                "bias": None,
+                                "qweight_nk": backend.qweight_nk.detach().cpu().contiguous(),
+                                "scale_b": backend.scale_b.detach().cpu().contiguous(),
+                                "input_scale": (
+                                    backend.input_scale.detach().cpu().contiguous()
+                                    if isinstance(getattr(backend, "input_scale", None), torch.Tensor)
+                                    else None
+                                ),
+                            }
+                            module_metadata = {
+                                "format": "vllm_cutlass_fp8_w8a8",
+                                "num_bits": 8,
+                                "activation_bits": 8,
+                                "weight_scale": "per_output_channel",
+                                "activation_scale": "dynamic_per_token",
+                            }
+                        else:
+                            payload = {
+                                "backend_class": target.backend_class,
+                                "bias": None,
+                                "qweight": backend.qweight.detach().cpu().contiguous(),
+                                "scales": backend.scales.detach().cpu().contiguous(),
+                                "input_scale": (
+                                    backend.input_scale.detach().cpu().contiguous()
+                                    if isinstance(getattr(backend, "input_scale", None), torch.Tensor)
+                                    else None
+                                ),
+                            }
+                            module_metadata = {
+                                "format": "vllm_marlin_wna16",
+                                "num_bits": target.num_bits,
+                                "activation_bits": 16,
+                                "group_size": int(backend.group_size),
+                                "wtype_id": int(backend.wtype_id),
+                            }
                         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", target.module_name)
                         tensor_rel = f"tensors/{safe_name}.pt"
                         torch.save(payload, temp_root / tensor_rel)
@@ -445,12 +479,9 @@ def build_robolab_quant_bundle(
                                 "name": target.module_name,
                                 "source_key": source_key,
                                 "backend_class": target.backend_class,
-                                "format": "vllm_marlin_wna16",
-                                "num_bits": target.num_bits,
-                                "group_size": int(backend.group_size),
+                                **module_metadata,
                                 "size_k": int(backend.size_k),
                                 "size_n": int(backend.size_n),
-                                "wtype_id": int(backend.wtype_id),
                                 "tensor_file": tensor_rel,
                             }
                         )
@@ -562,7 +593,9 @@ def build_robolab_quant_bundle(
         counts = {
             "w4": sum(target.num_bits == 4 for target in targets),
             "w8": sum(target.num_bits == 8 for target in targets),
+            "w8a8": sum(target.backend_class == "VllmCutlassFp8W8A8Linear" for target in targets),
         }
+        counts["w8a16"] = counts["w8"] - counts["w8a8"]
         manifest = {
             "schema_version": ROBOLAB_BUNDLE_SCHEMA_VERSION,
             "artifact_type": ROBOLAB_BUNDLE_ARTIFACT_TYPE,
@@ -578,10 +611,13 @@ def build_robolab_quant_bundle(
             ),
             "quantization": {
                 "strategy": strategy,
-                "weight_only": True,
-                "activation_quantization": False,
+                "weight_only": counts["w8a8"] == 0,
+                "activation_quantization": counts["w8a8"] > 0,
+                "activation_dtype": "fp8_e4m3fn" if counts["w8a8"] else "bf16",
                 "w4_modules": counts["w4"],
                 "w8_modules": counts["w8"],
+                "w8a16_modules": counts["w8a16"],
+                "w8a8_modules": counts["w8a8"],
                 "calibration_stats": Path(calibration_stats).name if calibration_stats else "",
                 "calibration_stats_sha256": _sha256(Path(calibration_stats).expanduser()) if calibration_stats else "",
                 "calibration_alpha": calibration_alpha,
@@ -623,6 +659,143 @@ def build_robolab_quant_bundle(
     }
 
 
+def convert_gen_w8_bundle_to_w8a8(
+    *,
+    base_bundle: str | Path,
+    source_checkpoint: str | Path,
+    output_dir: str | Path,
+    device: str = "cuda:0",
+    copy_mode: str = "hardlink",
+    calibration_stats: str | Path | None = None,
+    calibration_alpha: float = 0.5,
+) -> dict[str, Any]:
+    """Reuse calibrated W4 payloads and replace generation W8A16 payloads with FP8 W8A8."""
+
+    base_root = Path(base_bundle).expanduser().resolve()
+    source_root = Path(source_checkpoint).expanduser().resolve()
+    output_root = Path(output_dir).expanduser().resolve()
+    if output_root.exists():
+        raise FileExistsError(f"Refusing to overwrite existing RoboLab quant bundle: {output_root}")
+    base_validation = validate_robolab_quant_bundle(base_root, expected_strategy="gen_branch_w8")
+    manifest = base_validation["manifest"]
+    model_family = detect_model_family(source_root)
+    if manifest.get("model_family", model_family) != model_family:
+        raise ValueError("Base bundle and BF16 source checkpoint use different Cosmos3 model families")
+    targets = discover_quant_targets(source_root, "gen_branch_w8a8")
+    fp8_targets = {target.source_key: target for target in targets if target.backend_class == "VllmCutlassFp8W8A8Linear"}
+    stats = _load_calibration_stats(calibration_stats)
+    missing_stats = sorted(target.module_name for target in fp8_targets.values() if target.module_name not in stats)
+    if calibration_stats is not None and missing_stats:
+        raise ValueError(f"Activation calibration is missing {len(missing_stats)} generation-branch modules")
+    modules_by_source = {str(entry["source_key"]): entry for entry in manifest["modules"]}
+    if set(fp8_targets) - set(modules_by_source):
+        raise ValueError("Base bundle does not contain every generation-branch module required by the source checkpoint")
+
+    temp_root = output_root.with_name(f".{output_root.name}.tmp-{os.getpid()}")
+    if temp_root.exists():
+        raise FileExistsError(f"Temporary bundle path already exists: {temp_root}")
+    temp_root.mkdir(parents=True)
+    backend_module = _load_backend_module()
+    weight_map = _read_weight_map(source_root)
+    source_by_shard: dict[str, list[str]] = {}
+    for source_key in fp8_targets:
+        source_by_shard.setdefault(weight_map[source_key], []).append(source_key)
+
+    try:
+        _copy_tree(base_root, temp_root, copy_mode=copy_mode)
+        converted = 0
+        for rel_path, source_keys in sorted(source_by_shard.items()):
+            logger.info("Converting generation weights from source shard %s", rel_path)
+            with safe_open(str(source_root / rel_path), framework="pt", device="cpu") as shard:
+                for source_key in sorted(source_keys):
+                    target = fp8_targets[source_key]
+                    weight = shard.get_tensor(source_key).to(device=device, dtype=torch.bfloat16)
+                    input_scale = None
+                    if target.module_name in stats:
+                        input_scale = _input_scale(
+                            stats[target.module_name], size_k=int(weight.shape[1]), alpha=calibration_alpha
+                        )
+                    backend = backend_module.VllmCutlassFp8W8A8Linear(weight, input_scale=input_scale)
+                    torch.cuda.synchronize(device)
+                    payload = {
+                        "backend_class": target.backend_class,
+                        "bias": None,
+                        "qweight_nk": backend.qweight_nk.detach().cpu().contiguous(),
+                        "scale_b": backend.scale_b.detach().cpu().contiguous(),
+                        "input_scale": (
+                            backend.input_scale.detach().cpu().contiguous()
+                            if isinstance(getattr(backend, "input_scale", None), torch.Tensor)
+                            else None
+                        ),
+                    }
+                    entry = modules_by_source[source_key]
+                    tensor_rel = str(entry["tensor_file"])
+                    tensor_path = temp_root / tensor_rel
+                    tensor_path.unlink()
+                    torch.save(payload, tensor_path)
+                    for stale_key in ("group_size", "wtype_id"):
+                        entry.pop(stale_key, None)
+                    entry.update(
+                        {
+                            "backend_class": target.backend_class,
+                            "format": "vllm_cutlass_fp8_w8a8",
+                            "num_bits": 8,
+                            "activation_bits": 8,
+                            "weight_scale": "per_output_channel",
+                            "activation_scale": "dynamic_per_token",
+                            "size_k": int(backend.size_k),
+                            "size_n": int(backend.size_n),
+                        }
+                    )
+                    manifest["files"][tensor_rel] = _file_record(tensor_path)
+                    converted += 1
+                    del payload, backend, weight
+                    torch.cuda.empty_cache()
+
+        if converted != len(fp8_targets):
+            raise ValueError(f"Converted {converted} FP8 modules, expected {len(fp8_targets)}")
+        quantization = manifest["quantization"]
+        quantization.update(
+            {
+                "strategy": "gen_branch_w8a8",
+                "weight_only": False,
+                "activation_quantization": True,
+                "activation_dtype": "fp8_e4m3fn",
+                "w8a8_modules": converted,
+                "w8a16_modules": 0,
+                "activation_calibration": "input_equalization" if stats else "dynamic_per_token_only",
+                "activation_calibration_alpha": calibration_alpha if stats else None,
+            }
+        )
+        calibration_name = str(quantization.get("calibration_stats", ""))
+        quantization["calibration_stats"] = Path(calibration_name).name if calibration_name else ""
+        if calibration_stats is not None:
+            calibration_path = Path(calibration_stats).expanduser()
+            quantization["activation_calibration_stats"] = calibration_path.name
+            quantization["activation_calibration_stats_sha256"] = _sha256(calibration_path)
+        source = manifest.setdefault("source", {})
+        source["derived_from_bundle"] = base_root.name
+        source["checkpoint_path"] = source_root.name
+        manifest["created_unix"] = time.time()
+        manifest_path = temp_root / "manifest.json"
+        manifest_path.unlink()
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temp_root.rename(output_root)
+    except Exception:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+
+    validation = validate_robolab_quant_bundle(output_root, expected_strategy="gen_branch_w8a8")
+    return {
+        "bundle_dir": str(output_root),
+        "strategy": validation["strategy"],
+        "modules": validation["modules"],
+        "w4_modules": int(manifest["quantization"]["w4_modules"]),
+        "w8a8_modules": converted,
+        "bundle_bytes": validation["bundle_bytes"],
+    }
+
+
 def validate_robolab_quant_bundle(
     bundle_dir: str | Path,
     *,
@@ -640,8 +813,14 @@ def validate_robolab_quant_bundle(
     if manifest.get("artifact_type") != ROBOLAB_BUNDLE_ARTIFACT_TYPE or manifest.get("self_contained") is not True:
         raise ValueError("RoboLab quant artifact is not a self-contained deployment bundle")
     quantization = manifest.get("quantization")
-    if not isinstance(quantization, dict) or quantization.get("activation_quantization") is not False:
-        raise ValueError("RoboLab quant bundle must declare weight-only quantization")
+    if not isinstance(quantization, dict) or not isinstance(quantization.get("activation_quantization"), bool):
+        raise ValueError("RoboLab quant bundle must declare whether activations are quantized")
+    activation_quantization = bool(quantization["activation_quantization"])
+    weight_only = quantization.get("weight_only")
+    if not isinstance(weight_only, bool) or weight_only == activation_quantization:
+        raise ValueError("RoboLab quant bundle has inconsistent weight_only and activation_quantization flags")
+    if activation_quantization and quantization.get("activation_dtype") != "fp8_e4m3fn":
+        raise ValueError("RoboLab activation-quantized bundle must declare FP8 E4M3 activations")
     strategy = str(quantization.get("strategy", ""))
     if expected_strategy is not None and strategy != expected_strategy:
         raise ValueError(f"Expected strategy {expected_strategy!r}, found {strategy!r}")
@@ -656,6 +835,8 @@ def validate_robolab_quant_bundle(
             f"RoboLab quant bundle must contain {expected_modules} packed modules, found {len(modules or [])}"
         )
     names: set[str] = set()
+    fp8_w8a8_modules = 0
+    marlin_w8a16_modules = 0
     for entry in modules:
         if not isinstance(entry, dict):
             raise TypeError("RoboLab quant module metadata must be dictionaries")
@@ -665,15 +846,57 @@ def validate_robolab_quant_bundle(
         names.add(name)
         num_bits = int(entry.get("num_bits", 0))
         backend_class = str(entry.get("backend_class", ""))
-        if num_bits not in {4, 8} or f"W{num_bits}A16" not in backend_class:
+        is_fp8_w8a8 = backend_class == "VllmCutlassFp8W8A8Linear"
+        fp8_w8a8_modules += int(is_fp8_w8a8)
+        is_marlin = backend_class in {"VllmGptqMarlinW4A16Linear", "VllmGptqMarlinW8A16Linear"}
+        marlin_w8a16_modules += int(backend_class == "VllmGptqMarlinW8A16Linear")
+        if num_bits not in {4, 8} or not (is_fp8_w8a8 or (is_marlin and f"W{num_bits}A16" in backend_class)):
             raise ValueError(f"Inconsistent quant backend metadata for {name}")
+        if is_fp8_w8a8 and (
+            entry.get("format") != "vllm_cutlass_fp8_w8a8" or int(entry.get("activation_bits", 0)) != 8
+        ):
+            raise ValueError(f"Inconsistent FP8 activation metadata for {name}")
         rel = Path(str(entry.get("tensor_file", "")))
         if rel.is_absolute() or ".." in rel.parts or not (root / rel).is_file():
             raise ValueError(f"Quant tensor path must stay under the bundle root: {rel}")
         if check_tensors:
             payload = torch.load(root / rel, map_location="cpu", weights_only=True)
-            if not isinstance(payload, dict) or not {"qweight", "scales"}.issubset(payload):
+            required_tensors = {"qweight_nk", "scale_b"} if is_fp8_w8a8 else {"qweight", "scales"}
+            if not isinstance(payload, dict) or not required_tensors.issubset(payload):
                 raise ValueError(f"Invalid packed payload: {rel}")
+            if is_fp8_w8a8:
+                qweight = payload["qweight_nk"]
+                scale = payload["scale_b"]
+                expected_weight_shape = (int(entry["size_n"]), int(entry["size_k"]))
+                expected_scale_shape = (1, int(entry["size_n"]))
+                if not isinstance(qweight, torch.Tensor) or qweight.dtype != torch.float8_e4m3fn:
+                    raise ValueError(f"FP8 payload has invalid weight dtype: {rel}")
+                if tuple(qweight.shape) != expected_weight_shape:
+                    raise ValueError(f"FP8 payload has invalid weight shape: {rel}")
+                if not isinstance(scale, torch.Tensor) or scale.dtype != torch.float32:
+                    raise ValueError(f"FP8 payload has invalid scale dtype: {rel}")
+                if (
+                    tuple(scale.shape) != expected_scale_shape
+                    or not torch.all(torch.isfinite(scale))
+                    or not torch.all(scale > 0)
+                ):
+                    raise ValueError(f"FP8 payload has invalid scale values or shape: {rel}")
+                input_scale = payload.get("input_scale")
+                if input_scale is not None:
+                    if (
+                        not isinstance(input_scale, torch.Tensor)
+                        or input_scale.dtype != torch.bfloat16
+                        or tuple(input_scale.shape) != (int(entry["size_k"]),)
+                        or not torch.all(torch.isfinite(input_scale))
+                        or not torch.all(input_scale > 0)
+                    ):
+                        raise ValueError(f"FP8 payload has invalid input equalization scale: {rel}")
+    if activation_quantization != (fp8_w8a8_modules > 0):
+        raise ValueError("RoboLab quant bundle activation declaration does not match its module backends")
+    if int(quantization.get("w8a8_modules", fp8_w8a8_modules)) != fp8_w8a8_modules:
+        raise ValueError("RoboLab quant bundle W8A8 module count is inconsistent")
+    if int(quantization.get("w8a16_modules", marlin_w8a16_modules)) != marlin_w8a16_modules:
+        raise ValueError("RoboLab quant bundle W8A16 module count is inconsistent")
 
     runtime = manifest.get("runtime")
     if not isinstance(runtime, dict):
