@@ -9,7 +9,7 @@ import torch
 from cosmos_framework.scripts import quant_backend_microbench as backends
 from cosmos_framework.scripts import robolab_quant_runtime as runtime
 
-pytestmark = pytest.mark.GPU
+pytestmark = pytest.mark.gpus(1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

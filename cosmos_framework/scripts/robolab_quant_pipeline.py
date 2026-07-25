@@ -14,6 +14,7 @@ from typing import Any
 from cosmos_framework.scripts.robolab_quant_bundle import (
     build_robolab_quant_bundle,
     convert_gen_w8_bundle_to_w8a8,
+    convert_w8_bundle_to_w8a8,
     discover_quant_targets,
     validate_robolab_quant_bundle,
 )
@@ -167,6 +168,18 @@ def _parser() -> argparse.ArgumentParser:
     convert_parser.add_argument("--calibration-stats")
     convert_parser.add_argument("--calibration-alpha", type=float, default=0.5)
 
+    convert_full_parser = subparsers.add_parser(
+        "convert-full-w8-to-w8a8",
+        help="Convert every W8A16 Linear in a FullW8 bundle to FP8 W8A8",
+    )
+    convert_full_parser.add_argument("--base-bundle", required=True)
+    convert_full_parser.add_argument("--source-checkpoint", required=True)
+    convert_full_parser.add_argument("--output-dir", required=True)
+    convert_full_parser.add_argument("--device", default="cuda:0")
+    convert_full_parser.add_argument("--copy-mode", choices=("copy", "hardlink"), default="hardlink")
+    convert_full_parser.add_argument("--calibration-stats")
+    convert_full_parser.add_argument("--calibration-alpha", type=float, default=0.5)
+
     validate_parser = subparsers.add_parser("validate", help="Validate a deployment bundle")
     validate_parser.add_argument("--bundle-dir", required=True)
     validate_parser.add_argument("--expected-strategy")
@@ -223,6 +236,17 @@ def main() -> None:
             copy_mode=args.copy_mode,
             calibration_stats=args.calibration_stats,
             calibration_alpha=args.calibration_alpha,
+        )
+    elif args.command == "convert-full-w8-to-w8a8":
+        result = convert_w8_bundle_to_w8a8(
+            base_bundle=args.base_bundle,
+            source_checkpoint=args.source_checkpoint,
+            output_dir=args.output_dir,
+            device=args.device,
+            copy_mode=args.copy_mode,
+            calibration_stats=args.calibration_stats,
+            calibration_alpha=args.calibration_alpha,
+            strategy="full_w8a8",
         )
     elif args.command == "validate":
         result = validate_robolab_quant_bundle(

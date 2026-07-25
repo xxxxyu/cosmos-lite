@@ -30,7 +30,7 @@ ROBOLAB_BUNDLE_SCHEMA_VERSION = 1
 ROBOLAB_BUNDLE_ARTIFACT_TYPE = "cosmos3_robolab_quantized_policy"
 ROBOLAB_BUNDLE_ROOT_TOKEN = "__COSMOS3_ROBOLAB_QUANT_BUNDLE_ROOT__"
 
-StrategyName = Literal["full_w8", "full_w4", "attention_w8", "gen_branch_w8", "gen_branch_w8a8"]
+StrategyName = Literal["full_w8", "full_w4", "attention_w8", "gen_branch_w8", "gen_branch_w8a8", "full_w8a8"]
 ModelFamily = Literal["cosmos3_nano", "cosmos3_edge"]
 
 _QUANT_MODULE_PREFIX = "net.language_model.model.layers."
@@ -149,6 +149,8 @@ def _strategy_backend(strategy: StrategyName, source_key: str) -> tuple[str, int
         return None
     if strategy == "full_w8":
         return "VllmGptqMarlinW8A16Linear", 8
+    if strategy == "full_w8a8":
+        return "VllmCutlassFp8W8A8Linear", 8
     if strategy == "full_w4":
         return "VllmGptqMarlinW4A16Linear", 4
     if strategy == "attention_w8":
@@ -659,7 +661,7 @@ def build_robolab_quant_bundle(
     }
 
 
-def convert_gen_w8_bundle_to_w8a8(
+def convert_w8_bundle_to_w8a8(
     *,
     base_bundle: str | Path,
     source_checkpoint: str | Path,
@@ -668,28 +670,30 @@ def convert_gen_w8_bundle_to_w8a8(
     copy_mode: str = "hardlink",
     calibration_stats: str | Path | None = None,
     calibration_alpha: float = 0.5,
+    strategy: Literal["gen_branch_w8a8", "full_w8a8"] = "gen_branch_w8a8",
 ) -> dict[str, Any]:
-    """Reuse calibrated W4 payloads and replace generation W8A16 payloads with FP8 W8A8."""
+    """Reuse a W8A16 bundle and replace selected W8 payloads with FP8 W8A8."""
 
     base_root = Path(base_bundle).expanduser().resolve()
     source_root = Path(source_checkpoint).expanduser().resolve()
     output_root = Path(output_dir).expanduser().resolve()
     if output_root.exists():
         raise FileExistsError(f"Refusing to overwrite existing RoboLab quant bundle: {output_root}")
-    base_validation = validate_robolab_quant_bundle(base_root, expected_strategy="gen_branch_w8")
+    base_strategy = "gen_branch_w8" if strategy == "gen_branch_w8a8" else "full_w8"
+    base_validation = validate_robolab_quant_bundle(base_root, expected_strategy=base_strategy)
     manifest = base_validation["manifest"]
     model_family = detect_model_family(source_root)
     if manifest.get("model_family", model_family) != model_family:
         raise ValueError("Base bundle and BF16 source checkpoint use different Cosmos3 model families")
-    targets = discover_quant_targets(source_root, "gen_branch_w8a8")
+    targets = discover_quant_targets(source_root, strategy)
     fp8_targets = {target.source_key: target for target in targets if target.backend_class == "VllmCutlassFp8W8A8Linear"}
     stats = _load_calibration_stats(calibration_stats)
     missing_stats = sorted(target.module_name for target in fp8_targets.values() if target.module_name not in stats)
     if calibration_stats is not None and missing_stats:
-        raise ValueError(f"Activation calibration is missing {len(missing_stats)} generation-branch modules")
+        raise ValueError(f"Activation calibration is missing {len(missing_stats)} selected FP8 modules")
     modules_by_source = {str(entry["source_key"]): entry for entry in manifest["modules"]}
     if set(fp8_targets) - set(modules_by_source):
-        raise ValueError("Base bundle does not contain every generation-branch module required by the source checkpoint")
+        raise ValueError("Base bundle does not contain every selected FP8 module required by the source checkpoint")
 
     temp_root = output_root.with_name(f".{output_root.name}.tmp-{os.getpid()}")
     if temp_root.exists():
@@ -705,7 +709,7 @@ def convert_gen_w8_bundle_to_w8a8(
         _copy_tree(base_root, temp_root, copy_mode=copy_mode)
         converted = 0
         for rel_path, source_keys in sorted(source_by_shard.items()):
-            logger.info("Converting generation weights from source shard %s", rel_path)
+            logger.info("Converting selected FP8 weights from source shard %s", rel_path)
             with safe_open(str(source_root / rel_path), framework="pt", device="cpu") as shard:
                 for source_key in sorted(source_keys):
                     target = fp8_targets[source_key]
@@ -757,7 +761,7 @@ def convert_gen_w8_bundle_to_w8a8(
         quantization = manifest["quantization"]
         quantization.update(
             {
-                "strategy": "gen_branch_w8a8",
+                "strategy": strategy,
                 "weight_only": False,
                 "activation_quantization": True,
                 "activation_dtype": "fp8_e4m3fn",
@@ -785,7 +789,7 @@ def convert_gen_w8_bundle_to_w8a8(
         shutil.rmtree(temp_root, ignore_errors=True)
         raise
 
-    validation = validate_robolab_quant_bundle(output_root, expected_strategy="gen_branch_w8a8")
+    validation = validate_robolab_quant_bundle(output_root, expected_strategy=strategy)
     return {
         "bundle_dir": str(output_root),
         "strategy": validation["strategy"],
@@ -794,6 +798,12 @@ def convert_gen_w8_bundle_to_w8a8(
         "w8a8_modules": converted,
         "bundle_bytes": validation["bundle_bytes"],
     }
+
+
+def convert_gen_w8_bundle_to_w8a8(**kwargs: Any) -> dict[str, Any]:
+    """Backward-compatible generation-branch W8A8 conversion entry point."""
+
+    return convert_w8_bundle_to_w8a8(**kwargs, strategy="gen_branch_w8a8")
 
 
 def validate_robolab_quant_bundle(

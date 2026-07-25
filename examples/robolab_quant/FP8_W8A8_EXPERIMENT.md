@@ -1,22 +1,31 @@
-# Nano FP8 W8A8 Experiment
+# FP8 W8A8 Experiment
 
-This document tracks an experimental RTX 4090 path for Cosmos3 Nano. It keeps
-the non-generation branch in calibrated Marlin W4A16 and replaces generation
-branch W8A16 Linear modules with native Ada FP8 W8A8 kernels.
+This document tracks experimental RTX 4090 FP8 paths for Cosmos3 Nano and Edge.
+Two self-contained strategies are supported:
 
-The path is not part of the stable deployment recommendations yet. Closed-loop
-quality, rather than replay parity alone, is the release gate.
+- `gen_branch_w8a8` keeps the non-generation branch in calibrated Marlin
+  W4A16 and runs the generation branch with native Ada FP8 W8A8 kernels.
+- `full_w8a8` runs every quantized Linear module with FP8 W8A8 kernels.
 
-## Candidate
+These paths are not part of the stable deployment recommendations yet.
+Closed-loop quality, rather than replay parity alone, is the release gate.
 
-| Branch | Modules | Weights | Activations | Backend |
-|---|---:|---|---|---|
-| Generation | 252 | FP8 E4M3, per output channel | FP8 E4M3, dynamic per token | vLLM CUTLASS scaled GEMM |
-| Non-generation | 252 | INT4, calibrated per group | BF16 | vLLM Marlin W4A16 |
+## Candidates
 
-The self-contained `gen_branch_w8a8` bundle records activation quantization in
-its manifest and directly loads both packed backend formats. It requires native
-FP8 support (`SM89+`), which includes the RTX 4090 target.
+| Strategy | Model | W4A16 modules | FP8 W8A8 modules |
+|---|---|---:|---:|
+| GenW8A8 | Nano | 252 | 252 |
+| FullW8A8 | Nano | 0 | 504 |
+| GenW8A8 | Edge | 168 | 168 |
+| FullW8A8 | Edge | 0 | 336 |
+
+FP8 weights use E4M3 with one static scale per output channel. Activations use
+E4M3 with dynamic per-token scales and BF16 output. The mixed strategy uses
+calibrated INT4 weights for its retained W4 branch; dynamic FP8 activation
+quantization itself does not require calibration. Both bundle types record
+activation quantization in their manifest, directly load their packed payloads,
+and do not depend on the BF16 source checkpoint at inference time. They require
+native FP8 support (`SM89+`), which includes the RTX 4090 target.
 
 Two activation variants were evaluated:
 
@@ -54,7 +63,7 @@ the dominant large-M generation shapes. Applying FP8 indiscriminately to the
 small non-generation shapes is not beneficial; Marlin W4A16 remains faster for
 that branch.
 
-## Replay32
+## Nano Replay32
 
 Protocol: the same 32 captured DROID train requests, RTX 4090-NX-1, guidance 3,
 two UniPC steps, deterministic seed 0, and 32x8 actions. Latency is policy
@@ -66,6 +75,8 @@ but does not affect the median materially.
 | GenW8A16 reference | 1,674.5 / 1,681.6 | 1,632.5 | 15.20 / 15.50 | - | - | - |
 | Dynamic GenW8A8 | **1,340.0 / 1,345.2** | **1,295.1** | 15.20 / 15.50 | **0.03229** | 0.10157 | 0.32710 |
 | Equalized GenW8A8 | 1,361.8 / 1,368.3 | 1,324.3 | 15.20 / 15.50 | 0.03270 | **0.10156** | **0.29359** |
+| FullW8A16 reference | 1,680.4 / 1,685.1 | 1,643.5 | 18.56 / 19.07 | - | - | - |
+| Dynamic FullW8A8 | **1,329.9 / 1,337.7** | **1,286.5** | 18.57 / 19.07 | **0.03009** | **0.09115** | **0.28891** |
 
 Dynamic W8A8 reduces median request latency by 20.0% relative to GenW8A16. The
 equalized variant improves one tail metric, but slightly worsens mean error and
@@ -77,7 +88,30 @@ from FullW8 (`L1 mean=0.02825`, sample `Linf p95=0.28431`) while retaining stron
 closed-loop quality, so an absolute Linf threshold is not used as a rollout
 substitute.
 
-## Closed Loop
+FullW8A8 reduces median request latency by 20.9% relative to FullW8A16. It is
+only 10.1ms faster than mixed Dynamic GenW8A8, while increasing peak reserved
+memory by 3.57GB. This makes the mixed strategy the stronger Nano deployment
+tradeoff despite the slightly lower FullW8A8 request latency.
+
+## Edge Replay32
+
+The Edge experiment uses the same replay protocol and DROID train128 requests
+as Nano. References are the released Edge W8A16 bundles with matching branch
+precision policies.
+
+| Candidate | Request p50/p95 (ms) | Generate p50 (ms) | Peak alloc/reserved (GB) | L1 mean | Element error p95 | Sample Linf p95 |
+|---|---:|---:|---:|---:|---:|---:|
+| GenW8A16 reference | 573.5 / 589.6 | 525.9 | 6.36 / 8.79 | - | - | - |
+| Dynamic GenW8A8 | **502.8 / 526.8** | **464.3** | 6.36 / 8.79 | **0.02685** | **0.08037** | **0.27557** |
+| FullW8A16 reference | 567.7 / 584.0 | 520.6 | 6.36 / 8.71 | - | - | - |
+| Dynamic FullW8A8 | **510.6 / 526.3** | **472.2** | 6.36 / 8.71 | **0.03106** | **0.09144** | **0.30098** |
+
+GenW8A8 reduces median request latency by 12.3% relative to GenW8A16;
+FullW8A8 reduces it by 10.1% relative to FullW8A16. For Edge, GenW8A8 is both
+7.8ms faster and closer to its W8A16 reference than FullW8A8, so quantizing the
+remaining small non-generation Linear shapes to FP8 has no measured benefit.
+
+## Nano Closed Loop
 
 RoboLab `BananaInBowlTask`, one environment, guidance 3, two UniPC steps,
 32 generated and executed actions per policy request, and no video recording:
@@ -99,16 +133,37 @@ This result supports retaining the W8A8 path as an experimental high-throughput
 option. Stable README recommendations remain unchanged until the implementation
 and bundle distribution are reviewed for release.
 
+## Edge Closed Loop
+
+RoboLab `BananaInBowlTask` uses the same protocol as Nano: one environment,
+guidance 3, two UniPC steps, 32 generated and executed actions per policy
+request, and no video recording.
+
+| Candidate | Success (Wilson 95% CI) | Paired wins/losses vs W8A16 | McNemar p |
+|---|---:|---:|---:|
+| GenW8A16 reference | 40/50 = 80% [67.0%, 88.8%] | reference | - |
+| Dynamic GenW8A8 | **39/50 = 78% [64.8%, 87.2%]** | 8/9 | 1.000 |
+| FullW8A16 reference | 36/50 = 72% [58.3%, 82.5%] | reference | - |
+| Dynamic FullW8A8 | **37/50 = 74% [60.4%, 84.1%]** | 10/9 | 1.000 |
+
+Each candidate is evaluated on exactly the initial states 0-49. Two independent
+policy/simulator GPU pairs evaluate disjoint 25-episode ranges; canonical
+results exclude resume placeholders and contain each episode ID exactly once.
+Neither FP8 candidate is distinguishable from its precision-matched W8A16
+reference on this 50-episode protocol. GenW8A8 retains the higher point estimate
+and the lower replay error while also being faster than FullW8A8, so it is the
+preferred Edge FP8 candidate.
+
 ## Reproduction
 
-Convert only the generation branch of an existing self-contained Nano GenW8
-bundle:
+Convert only the generation branch of an existing self-contained Nano or Edge
+GenW8 bundle:
 
 ```bash
 python -m cosmos_framework.scripts.robolab_quant_pipeline \
   convert-gen-w8-to-w8a8 \
   --base-bundle /path/to/nano-gen-w8-bundle \
-  --source-checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+  --source-checkpoint /path/to/Cosmos3-Policy-DROID \
   --output-dir /path/to/nano-gen-w8a8-bundle \
   --device cuda:0
 
@@ -122,3 +177,21 @@ python -m cosmos_framework.scripts.robolab_quant_pipeline validate \
 The converter streams source safetensor shards, reuses the existing calibrated
 W4 payloads and residual assets, and rewrites only the generation payloads. The
 result does not depend on the BF16 checkpoint at inference time.
+
+Convert every quantized Linear module of an existing self-contained FullW8
+bundle:
+
+```bash
+python -m cosmos_framework.scripts.robolab_quant_pipeline \
+  convert-full-w8-to-w8a8 \
+  --base-bundle /path/to/full-w8-bundle \
+  --source-checkpoint /path/to/Cosmos3-Policy-DROID \
+  --output-dir /path/to/full-w8a8-bundle \
+  --device cuda:0
+
+python -m cosmos_framework.scripts.robolab_quant_pipeline validate \
+  --bundle-dir /path/to/full-w8a8-bundle \
+  --expected-strategy full_w8a8 \
+  --check-hashes \
+  --check-tensors
+```

@@ -104,11 +104,13 @@ def test_strategy_precision_maps_match_nano_release_counts() -> None:
         "attention_w8": (216, 288),
         "gen_branch_w8": (252, 252),
         "gen_branch_w8a8": (252, 252),
+        "full_w8a8": (0, 504),
     }
     for strategy, counts in expected.items():
         bits = [_strategy_backend(strategy, key)[1] for key in keys]  # type: ignore[arg-type, union-attr]
         assert (bits.count(4), bits.count(8)) == counts
     assert sum(_strategy_backend("gen_branch_w8a8", key)[0] == "VllmCutlassFp8W8A8Linear" for key in keys) == 252
+    assert sum(_strategy_backend("full_w8a8", key)[0] == "VllmCutlassFp8W8A8Linear" for key in keys) == 504
 
 
 def test_strategy_precision_maps_match_edge_release_counts() -> None:
@@ -119,11 +121,13 @@ def test_strategy_precision_maps_match_edge_release_counts() -> None:
         "attention_w8": (112, 224),
         "gen_branch_w8": (168, 168),
         "gen_branch_w8a8": (168, 168),
+        "full_w8a8": (0, 336),
     }
     for strategy, counts in expected.items():
         bits = [_strategy_backend(strategy, key)[1] for key in keys]  # type: ignore[arg-type, union-attr]
         assert (bits.count(4), bits.count(8)) == counts
     assert sum(_strategy_backend("gen_branch_w8a8", key)[0] == "VllmCutlassFp8W8A8Linear" for key in keys) == 168
+    assert sum(_strategy_backend("full_w8a8", key)[0] == "VllmCutlassFp8W8A8Linear" for key in keys) == 336
 
 
 def test_public_edge_manifest_uses_revision_uris_without_local_paths(tmp_path: Path) -> None:
