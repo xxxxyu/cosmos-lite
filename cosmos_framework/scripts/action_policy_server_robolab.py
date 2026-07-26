@@ -343,6 +343,7 @@ class RobolabPolicyConfig:
     resolution: str | None
     action_chunk_size: int
     action_dim: int
+    condition_kv_cache: bool = False
     image_height: int = _DEFAULT_IMAGE_HEIGHT
     image_width: int = _DEFAULT_IMAGE_WIDTH
     action_space: ActionSpace = "joint_pos"
@@ -401,6 +402,8 @@ class RobolabServerArgs(pydantic.BaseModel):
     """Use symbolic-shape compiled MoT kernels. Required for varying policy prompt lengths."""
     fp8_projection_fusion: Literal["none", "shared"] = "none"
     """Share FP8 activation quantization across eligible QKV and gated-MLP projections."""
+    condition_kv_cache: bool = False
+    """Reuse invariant understanding K/V across denoising steps (experimental, batch size 1)."""
 
     seed: int = 0
     """Base generation seed used to initialize the request RNG."""
@@ -512,6 +515,7 @@ class RobolabPolicyService:
             guidance=float(args.guidance),
             num_steps=int(args.num_steps),
             shift=float(args.shift),
+            condition_kv_cache=bool(args.condition_kv_cache),
             conditioning_fps=float(
                 args.conditioning_fps or inferred.get("conditioning_fps") or _DEFAULT_CONDITIONING_FPS
             ),
@@ -557,6 +561,7 @@ class RobolabPolicyService:
             f"chunk={self.cfg.action_chunk_size} history={self.cfg.history_length} use_state={self.cfg.use_state} "
             f"image={self.cfg.image_height}x{self.cfg.image_width} fps={self.cfg.conditioning_fps} "
             f"guidance={self.cfg.guidance} num_steps={self.cfg.num_steps} shift={self.cfg.shift} "
+            f"condition_kv_cache={self.cfg.condition_kv_cache} "
             f"seed={self.cfg.seed} deterministic_seed={self.cfg.deterministic_seed}"
         )
         _write_profile_event(
@@ -571,6 +576,8 @@ class RobolabPolicyService:
             compiled_region=args.compiled_region,
             compile_dynamic=args.compile_dynamic,
             fp8_projection_fusion=args.fp8_projection_fusion,
+            sage_attention_requested=os.environ.get("COSMOS3_SAGE_ATTENTION", "0") == "1",
+            condition_kv_cache=args.condition_kv_cache,
             fp8_projection_groups=(
                 self._quant_loader.fp8_projection_groups if self._quant_loader is not None else None
             ),
@@ -791,6 +798,7 @@ class RobolabPolicyService:
                     seed=[seed],
                     num_steps=self.cfg.num_steps,
                     shift=self.cfg.shift,
+                    condition_kv_cache=self.cfg.condition_kv_cache,
                 )
         generate_ms = (time.perf_counter() - generate_start) * 1000.0
 

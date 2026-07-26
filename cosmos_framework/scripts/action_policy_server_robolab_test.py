@@ -85,6 +85,7 @@ def test_server_args_default_to_released_droid_serving_config() -> None:
     assert args.compiled_region == "language"
     assert args.compile_dynamic is True
     assert args.fp8_projection_fusion == "none"
+    assert args.condition_kv_cache is False
     assert args.vae_encode_chunk_frames == 8
     assert args.hf_revision == "main"
     assert args.domain_name == "droid_lerobot"

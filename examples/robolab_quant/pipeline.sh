@@ -4,6 +4,9 @@
 
 set -euo pipefail
 export COSMOS_TRAINING=0
+if [[ "${SAGE_ATTENTION:-0}" == "1" ]]; then
+  export COSMOS3_SAGE_ATTENTION=1
+fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
@@ -79,6 +82,9 @@ build_compile_args() {
   fi
   if [[ "${FP8_PROJECTION_FUSION:-none}" != "none" ]]; then
     compile_args+=(--fp8-projection-fusion "${FP8_PROJECTION_FUSION}")
+  fi
+  if [[ "${CONDITION_KV_CACHE:-0}" == "1" ]]; then
+    compile_args+=(--condition-kv-cache)
   fi
 }
 
@@ -222,7 +228,7 @@ Required environment variables by command:
   validate:     BUNDLE_DIR; optional STRATEGY
   serve:        BUNDLE_DIR; optional POLICY_GPU, HOST, PORT, GUIDANCE, NUM_STEPS,
                 TORCH_COMPILE, COMPILED_REGION, COMPILE_DYNAMIC, CUDA_GRAPHS,
-                FP8_PROJECTION_FUSION
+                FP8_PROJECTION_FUSION, SAGE_ATTENTION, CONDITION_KV_CACHE
   replay:       BUNDLE_DIR, CAPTURE_DIR; optional REPLAY_LIMIT and server variables
   rollout:      BUNDLE_DIR, ROBOLAB_DIR, ROBOLAB_PYTHON; optional SIM_GPU, TASK,
                 NUM_ENVS, NUM_RUNS, VIDEO_MODE and server variables

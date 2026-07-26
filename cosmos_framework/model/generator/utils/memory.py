@@ -100,3 +100,54 @@ class MemoryState(ABC):
         visibility itself return ``False``.
         """
         return True
+
+
+@dataclass
+class ConditionKVCacheValue(MemoryValue):
+    """Per-layer understanding K/V reused across denoising steps."""
+
+    und_k: torch.Tensor | None = None
+    und_v: torch.Tensor | None = None
+    frame_idx: int = 0
+
+
+class ConditionKVCacheState(MemoryState):
+    """Request-local cache for an invariant understanding condition.
+
+    The first network forward populates one understanding K/V pair per layer.
+    Later denoising steps execute only the generation tower. A separate state
+    must be used for each CFG branch because their text conditions differ.
+    """
+
+    def __init__(self) -> None:
+        self._layers: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._gen_only = False
+
+    def init(self, hidden_states: dict, device: torch.device) -> None:
+        del hidden_states, device
+        self._gen_only = bool(self._layers)
+
+    def read_for_layer(self, layer_idx: int) -> ConditionKVCacheValue:
+        cached = self._layers.get(layer_idx)
+        if cached is None:
+            if self._gen_only:
+                raise RuntimeError(f"Condition K/V cache is incomplete at layer {layer_idx}")
+            return ConditionKVCacheValue()
+        und_k, und_v = cached
+        return ConditionKVCacheValue(und_k=und_k, und_v=und_v, frame_idx=1)
+
+    def write_for_layer(self, layer_idx: int, kv_to_store: KVToStore) -> None:
+        if self._gen_only:
+            return
+        _, _, und_k, und_v = kv_to_store
+        self._layers[layer_idx] = (und_k.detach(), und_v.detach())
+
+    def is_gen_only(self) -> bool:
+        return self._gen_only
+
+    def requires_natten_metadata(self) -> bool:
+        return False
+
+    def clear(self) -> None:
+        self._layers.clear()
+        self._gen_only = False
