@@ -15,6 +15,7 @@ from cosmos_framework.model.attention.flash2.checks import flash2_attention_chec
 from cosmos_framework.model.attention.flash3.checks import flash3_attention_check
 from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.attention.natten.checks import natten_attention_check, natten_multi_dim_attention_check
+from cosmos_framework.model.attention.sage.checks import sage_attention_check
 from cosmos_framework.model.attention.utils import get_arch_tag
 from cosmos_framework.model.attention.utils.environment import (
     filter_attention_backends,
@@ -28,6 +29,7 @@ BACKEND_CHECK_MAP = {
     "natten": natten_attention_check,
     "flash2": flash2_attention_check,
     "flash3": flash3_attention_check,
+    "sage": sage_attention_check,
 }
 
 BACKEND_MULTI_DIM_CHECK_MAP = {
@@ -149,6 +151,7 @@ def get_backend_list(arch_tag: int) -> list[str]:
         ]
     elif arch_tag >= 80:
         default_backends = [
+            "sage",
             "flash2",
             "cudnn",
             "natten",
@@ -174,6 +177,7 @@ def choose_backend(
     deterministic: bool = False,
     backend: str | None = None,
     raise_error: bool = True,
+    excluded_backends: tuple[str, ...] = (),
 ) -> str | None:
     """
     Selects a compatible backend, unless one is already selected, which runs its corresponding
@@ -208,11 +212,16 @@ def choose_backend(
         raise_error (bool): whether to raise an error if any checks fail or no backend is selected,
             instead of just returning False. Default is **True**.
 
+        excluded_backends (tuple[str, ...]): compatible backends to skip for
+            call-specific capabilities not represented by the common checks.
+
     Returns:
         backend (str | None): selected backend, or None if no backends are compatible.
 
     """
     if backend is not None:
+        if backend in excluded_backends:
+            return None
         if is_backend_compatible(
             backend=backend,
             query_shape=query_shape,
@@ -233,6 +242,8 @@ def choose_backend(
     arch_tag = get_arch_tag(device)
     backend_list = get_backend_list(arch_tag)
     for backend in backend_list:
+        if backend in excluded_backends:
+            continue
         if is_backend_compatible(
             backend=backend,
             query_shape=query_shape,

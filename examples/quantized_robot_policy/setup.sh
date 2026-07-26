@@ -28,4 +28,8 @@ COSMOS_TRAINING=0 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
     --require-cuda \
     --repo-root "$repo_root"
 
+if [[ "${INSTALL_SAGE_ATTENTION:-0}" == "1" ]]; then
+  COSMOS_QUANT_PYTHON="$python_bin" "$script_dir/install_sage_attention.sh"
+fi
+
 printf '\nRuntime ready. Use: %s\n' "$python_bin"

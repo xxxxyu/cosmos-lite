@@ -44,6 +44,17 @@ machine. A fresh checkout must pass this command before bundle validation.
 The pipeline exports `COSMOS_TRAINING=0` so inference does not import optional
 training, cloud-storage, or dataset backends.
 
+RTX 4090 deployments may optionally build the pinned SageAttention SM89
+backend after the minimal runtime is installed:
+
+```bash
+examples/quantized_robot_policy/install_sage_attention.sh
+```
+
+It is never required to load a bundle. Set `COSMOS3_SAGE_ATTENTION=1` when
+serving to use it for supported long, dense generation attention; unsupported
+shapes continue to use FlashAttention2.
+
 ## Choose A Pipeline
 
 - [RoboCasa365](../robocasa365_quant/README.md): start from a fine-tuned BF16
