@@ -77,6 +77,9 @@ build_compile_args() {
       compile_args+=(--no-compile-dynamic)
     fi
   fi
+  if [[ "${FP8_PROJECTION_FUSION:-none}" != "none" ]]; then
+    compile_args+=(--fp8-projection-fusion "${FP8_PROJECTION_FUSION}")
+  fi
 }
 
 start_server() {
@@ -218,7 +221,8 @@ Required environment variables by command:
   build-public: ASSET_DIR, BUNDLE_DIR; optional MODEL_FAMILY, STRATEGY, CALIBRATION_STATS, POLICY_GPU
   validate:     BUNDLE_DIR; optional STRATEGY
   serve:        BUNDLE_DIR; optional POLICY_GPU, HOST, PORT, GUIDANCE, NUM_STEPS,
-                TORCH_COMPILE, COMPILED_REGION, COMPILE_DYNAMIC, CUDA_GRAPHS
+                TORCH_COMPILE, COMPILED_REGION, COMPILE_DYNAMIC, CUDA_GRAPHS,
+                FP8_PROJECTION_FUSION
   replay:       BUNDLE_DIR, CAPTURE_DIR; optional REPLAY_LIMIT and server variables
   rollout:      BUNDLE_DIR, ROBOLAB_DIR, ROBOLAB_PYTHON; optional SIM_GPU, TASK,
                 NUM_ENVS, NUM_RUNS, VIDEO_MODE and server variables

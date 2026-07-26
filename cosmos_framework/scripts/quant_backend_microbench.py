@@ -368,15 +368,59 @@ class VllmCutlassFp8W8A8Linear(nn.Module):
         x_2d = x.reshape(-1, x.shape[-1]).contiguous()
         if self.input_scale is not None:
             x_2d = (x_2d / self.input_scale).contiguous()
-        q_x, scale_a = self._ops().scaled_fp8_quant(x_2d, use_per_token_if_dynamic=True)
-        out = self._ops().cutlass_scaled_mm(
+        q_x, scale_a = self.quantize_input(x_2d)
+        out = self.forward_quantized(q_x, scale_a)
+        return out.reshape(x.shape[:-1] + (self.size_n,)).to(torch.bfloat16)
+
+    def quantize_input(self, x_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._ops().scaled_fp8_quant(x_2d, use_per_token_if_dynamic=True)
+
+    def forward_quantized(self, q_x: torch.Tensor, scale_a: torch.Tensor) -> torch.Tensor:
+        return self._ops().cutlass_scaled_mm(
             q_x,
             self.qweight_nk.t(),
             scale_a,
             self.scale_b,
             torch.bfloat16,
         )
-        return out.reshape(x.shape[:-1] + (self.size_n,)).to(torch.bfloat16)
+
+
+class VllmCutlassFp8ProjectionGroup(nn.Module):
+    """Share dynamic activation quantization across compatible FP8 projections."""
+
+    def __init__(self, projections: list[VllmCutlassFp8W8A8Linear]) -> None:
+        super().__init__()
+        if len(projections) < 2:
+            raise ValueError("An FP8 projection group requires at least two projections")
+        size_k = projections[0].size_k
+        if any(projection.size_k != size_k for projection in projections):
+            raise ValueError("Grouped FP8 projections must have the same input width")
+        if any(projection.input_scale is not None for projection in projections):
+            raise ValueError("Grouped FP8 projections require identical unscaled activation inputs")
+        self.size_k = size_k
+        self.out_features = tuple(projection.size_n for projection in projections)
+        self.projections = nn.ModuleList(projections)
+
+    @staticmethod
+    def _ops():
+        from vllm import _custom_ops as ops
+
+        return ops
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        q_x, scale_a = self._ops().scaled_fp8_quant(x_2d, use_per_token_if_dynamic=True)
+        outputs = tuple(projection.forward_quantized(q_x, scale_a) for projection in self.projections)
+        prefix = x.shape[:-1]
+        return tuple(
+            output.reshape(prefix + (size_n,)).to(torch.bfloat16)
+            for output, size_n in zip(outputs, self.out_features, strict=True)
+        )
+
+    def _apply(self, fn, recurse: bool = True):
+        # Runtime groups are assembled after their packed buffers are already
+        # on the deployment device. A parent to_empty() must not destroy them.
+        return self
 
 
 class VllmAllSparkW8A16Linear(nn.Module):

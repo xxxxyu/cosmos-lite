@@ -14,6 +14,7 @@ TORCH_COMPILE=1 \
 COMPILED_REGION=language \
 COMPILE_DYNAMIC=1 \
 CUDA_GRAPHS=0 \
+FP8_PROJECTION_FUSION=shared \
 BUNDLE_DIR=/path/to/gen_w8a8_bundle \
 examples/robolab_quant/pipeline.sh replay
 ```
@@ -23,6 +24,12 @@ requests. Compilation is lazy: a cold first request took about 12.5 seconds
 for Edge and 14.9 seconds for Nano. Production services must issue a warmup
 request before control starts. The Inductor disk cache reduces later process
 startup cost but is specific to the PyTorch, CUDA, GPU, and model environment.
+
+`FP8_PROJECTION_FUSION=shared` is specific to FP8 W8A8 bundles. It dynamically
+quantizes a common activation once for the generation Q/K/V projections and,
+on Nano, for the gated-MLP gate/up projections. The existing CUTLASS GEMMs and
+their packed weights are unchanged, so this optimization is bit-identical to
+the independent-Linear path.
 
 ## Replay32
 
@@ -99,3 +106,59 @@ path. The final device-to-CPU action transfer is the required request completion
 boundary. Sampler timestep transfers remain, but they are few and were not
 changed without evidence that an invasive packing API rewrite would have a
 meaningful end-to-end return.
+
+## FP8 Projection Fusion Follow-up
+
+An Nsight Systems trace over four eager GenW8A8 requests measured the kernel
+headroom before changing the runtime:
+
+| Model | FP8 GEMM | Dynamic FP8 quant | FlashAttention | Quant time/request |
+|---|---:|---:|---:|---:|
+| Edge | 41.3% | 3.1% | 18.2% | 10.6 ms |
+| Nano | 54.2% | 3.3% | 13.3% | 34.6 ms |
+
+Dynamic quantization alone is not a large end-to-end bottleneck. The useful
+opportunity is eliminating repeated quantization of the same activation
+without replacing the tuned CUTLASS GEMMs.
+
+The real-shape operator benchmark used 3,093 tokens on RTX 4090:
+
+| Projection group | Separate (ms) | Shared quant (ms) | Packed GEMM (ms) |
+|---|---:|---:|---:|
+| Edge QKV, K=2,048, N=2,048+1,024+1,024 | 0.375 | 0.357 | **0.311** |
+| Nano QKV, K=4,096, N=4,096+1,024+1,024 | 0.836 | **0.791** | 0.797 |
+| Nano gate/up, K=4,096, N=12,288+12,288 | 2.345 | 2.306 | **2.220** |
+
+Packed GEMM concatenates weights along the output dimension. Although it wins
+two isolated shapes, it changes CUTLASS accumulation tiling, is not
+bit-identical, and raises Nano peak reserved memory to 19.0GB when weights are
+assembled at load time. It did not consistently beat shared quantization in
+replay, so it is not exposed by the deployment runtime.
+
+Sequential replay32 on one otherwise idle RTX 4090 used dynamic language-block
+compile in both rows. The first cold-compile request is excluded from latency:
+
+| Model | FP8 projections | Request p50/p95 (ms) | Generate p50 (ms) | Peak reserved (GB) | L1 / Linf p95 |
+|---|---|---:|---:|---:|---:|
+| Edge | Independent | 436.8 / 438.2 | 398.4 | 8.79 | 0 / 0 |
+| Edge | Shared quant | **428.6** / 443.5 | **394.6** | 8.79 | 0 / 0 |
+| Nano | Independent | 1144.3 / 1148.5 | 1108.6 | 15.50 | 0 / 0 |
+| Nano | Shared quant | **1119.9 / 1124.3** | **1082.3** | 15.50 | 0 / 0 |
+
+Shared quantization reduces median request latency by 1.9% for Edge and 2.1%
+for Nano on top of block compilation. All 32 action tensors are bit-identical
+to the independent-projection compile reference. Edge p95 includes transient
+clock variation late in the run; its p50 and kernel-level saving are the more
+stable indicators for this small optimization.
+
+A five-episode closed-loop integration smoke test of the final shared-quant
+runtime completed successfully for both models:
+
+| Model | Runtime | Banana success |
+|---|---|---:|
+| Edge | Language dynamic + shared quant | 5/5 |
+| Nano | Language dynamic + shared quant | 4/5 |
+
+This small sample verifies the end-to-end server and RoboLab integration; it is
+not used as a success-rate estimate. Quality evidence comes from exact replay32
+parity for shared quantization and the 50-episode compile comparison above.

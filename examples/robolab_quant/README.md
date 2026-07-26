@@ -18,6 +18,22 @@ path and rejected CUDA Graph variants are documented in the
 recommendations below remain W4A16/W8A16 pending release review and bundle
 distribution.
 
+For experimental GenW8A8 deployment on RTX 4090, the validated training-free
+runtime optimization is:
+
+```bash
+TORCH_COMPILE=1 \
+COMPILED_REGION=language \
+COMPILE_DYNAMIC=1 \
+FP8_PROJECTION_FUSION=shared \
+BUNDLE_DIR=/path/to/gen_w8a8_bundle \
+examples/robolab_quant/pipeline.sh serve
+```
+
+Issue one warmup request before control starts. Projection sharing requires an
+FP8 bundle and is rejected when shape recording or online calibration-stat
+collection is enabled.
+
 ## 1. Setup
 
 ```bash

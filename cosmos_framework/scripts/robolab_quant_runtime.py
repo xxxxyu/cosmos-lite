@@ -190,13 +190,54 @@ def _make_backend(
 class RobolabDirectQuantLoader:
     """Process-lifetime patch that replaces Linear modules before CUDA materialization."""
 
-    def __init__(self, bundle_dir: str | Path) -> None:
+    def __init__(self, bundle_dir: str | Path, *, fp8_projection_fusion: str = "none") -> None:
         self.root = Path(bundle_dir).expanduser().resolve()
         self.validation = validate_robolab_quant_bundle(self.root)
         self.manifest = self.validation["manifest"]
+        if fp8_projection_fusion not in {"none", "shared"}:
+            raise ValueError(f"Unsupported FP8 projection fusion mode: {fp8_projection_fusion!r}")
+        self.fp8_projection_fusion = fp8_projection_fusion
+        self.fp8_projection_groups: dict[str, int] = {"qkv": 0, "gate_up": 0}
         self._applied = False
         self._original_from_pretrained: Any = None
         self._original_to_empty: Any = None
+
+    @staticmethod
+    def _fp8_backend(wrapper: nn.Module, backend_cls: type[nn.Module]) -> nn.Module | None:
+        if not isinstance(wrapper, QuantLinearWithOptionalBias) or wrapper.bias is not None:
+            return None
+        return wrapper.backend if isinstance(wrapper.backend, backend_cls) else None
+
+    def _install_fp8_projection_groups(self, network: nn.Module, backend_module: Any) -> None:
+        if self.fp8_projection_fusion == "none":
+            return
+        backend_cls = backend_module.VllmCutlassFp8W8A8Linear
+        group_cls = backend_module.VllmCutlassFp8ProjectionGroup
+        for module in list(network.modules()):
+            qkv_wrappers = [
+                getattr(module, name, None)
+                for name in ("q_proj_moe_gen", "k_proj_moe_gen", "v_proj_moe_gen")
+            ]
+            qkv_backends = [self._fp8_backend(wrapper, backend_cls) for wrapper in qkv_wrappers]
+            if all(backend is not None for backend in qkv_backends):
+                module.qkv_proj_moe_gen = group_cls(qkv_backends)
+                module.q_proj_moe_gen = nn.Identity()
+                module.k_proj_moe_gen = nn.Identity()
+                module.v_proj_moe_gen = nn.Identity()
+                self.fp8_projection_groups["qkv"] += 1
+
+            gate_up_wrappers = [getattr(module, name, None) for name in ("gate_proj", "up_proj")]
+            gate_up_backends = [self._fp8_backend(wrapper, backend_cls) for wrapper in gate_up_wrappers]
+            if all(backend is not None for backend in gate_up_backends):
+                module.gate_up_proj = group_cls(gate_up_backends)
+                module.gate_proj = nn.Identity()
+                module.up_proj = nn.Identity()
+                self.fp8_projection_groups["gate_up"] += 1
+
+        if not any(self.fp8_projection_groups.values()):
+            raise ValueError(
+                f"FP8 projection fusion mode {self.fp8_projection_fusion!r} found no compatible projection groups"
+            )
 
     def _load_packed_modules(self, network: nn.Module) -> None:
         if self._applied:
@@ -216,6 +257,7 @@ class RobolabDirectQuantLoader:
             )
             _set_module(network, set_name, wrapped)
             del payload
+        self._install_fp8_projection_groups(network, backend_module)
         self._applied = True
 
     def install(self) -> None:

@@ -40,3 +40,27 @@ def test_fp8_backend_payload_round_trip() -> None:
     assert restored.qweight_nk.dtype == torch.float8_e4m3fn
     assert restored.scale_b.dtype == torch.float32
     torch.testing.assert_close(restored.input_scale, input_scale, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fp8_projection_group_matches_independent_linears() -> None:
+    device = torch.device("cuda:0")
+    capability = torch.cuda.get_device_capability(device)
+    if capability[0] * 10 + capability[1] < 89:
+        pytest.skip("Native FP8 requires SM89 or newer")
+
+    generator = torch.Generator(device=device).manual_seed(11)
+    x = torch.randn(5, 17, 128, dtype=torch.bfloat16, device=device, generator=generator)
+    projections = [
+        backends.VllmCutlassFp8W8A8Linear(
+            torch.randn(size_n, 128, dtype=torch.bfloat16, device=device, generator=generator)
+        )
+        for size_n in (256, 128, 128)
+    ]
+    expected = tuple(projection(x) for projection in projections)
+    group = backends.VllmCutlassFp8ProjectionGroup(projections)
+
+    actual = group(x)
+
+    for grouped, independent in zip(actual, expected, strict=True):
+        torch.testing.assert_close(grouped, independent, rtol=0, atol=0)

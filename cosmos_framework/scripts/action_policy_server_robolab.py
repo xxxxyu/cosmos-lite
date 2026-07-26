@@ -399,6 +399,8 @@ class RobolabServerArgs(pydantic.BaseModel):
     """Compile MoT language blocks only, or also compile the VFM encode/decode heads."""
     compile_dynamic: bool = True
     """Use symbolic-shape compiled MoT kernels. Required for varying policy prompt lengths."""
+    fp8_projection_fusion: Literal["none", "shared"] = "none"
+    """Share FP8 activation quantization across eligible QKV and gated-MLP projections."""
 
     seed: int = 0
     """Base generation seed used to initialize the request RNG."""
@@ -441,6 +443,10 @@ class RobolabPolicyService:
             raise ValueError("--use-cuda-graphs requires --use-torch-compile")
         if args.use_torch_compile and os.environ.get("COSMOS3_LINEAR_SHAPES_JSONL"):
             raise ValueError("MoT fullgraph compile is incompatible with COSMOS3_LINEAR_SHAPES_JSONL")
+        if args.fp8_projection_fusion != "none" and os.environ.get("COSMOS3_LINEAR_SHAPES_JSONL"):
+            raise ValueError("FP8 projection fusion is incompatible with COSMOS3_LINEAR_SHAPES_JSONL")
+        if args.fp8_projection_fusion != "none" and args.calibration_stats_output is not None:
+            raise ValueError("FP8 projection fusion is incompatible with online calibration-stat collection")
         load_start = time.perf_counter()
         self._profile_jsonl = args.profile_jsonl.expanduser().resolve() if args.profile_jsonl is not None else None
         self._quant_loader: RobolabDirectQuantLoader | None = None
@@ -455,7 +461,10 @@ class RobolabPolicyService:
             _configure_quant_vae_runtime(materialized_config, args)
             config_file_override = str(materialized_config)
             args = args.model_copy(update={"checkpoint_path": str(quant_root)})
-            self._quant_loader = RobolabDirectQuantLoader(quant_root)
+            self._quant_loader = RobolabDirectQuantLoader(
+                quant_root,
+                fp8_projection_fusion=args.fp8_projection_fusion,
+            )
             self._quant_loader.install()
             _write_profile_event(
                 self._profile_jsonl,
@@ -465,6 +474,7 @@ class RobolabPolicyService:
                 modules=validation["modules"],
                 residual_state_keys=validation["residual_state_keys"],
                 bundle_bytes=validation["bundle_bytes"],
+                fp8_projection_fusion=args.fp8_projection_fusion,
             )
         else:
             resolved_checkpoint_path = _resolve_checkpoint_path(args.checkpoint_path, hf_revision=args.hf_revision)
@@ -560,6 +570,10 @@ class RobolabPolicyService:
             use_cuda_graphs=args.use_cuda_graphs,
             compiled_region=args.compiled_region,
             compile_dynamic=args.compile_dynamic,
+            fp8_projection_fusion=args.fp8_projection_fusion,
+            fp8_projection_groups=(
+                self._quant_loader.fp8_projection_groups if self._quant_loader is not None else None
+            ),
         )
 
     def _install_calibration_hooks(self) -> None:

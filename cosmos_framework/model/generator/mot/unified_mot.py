@@ -610,13 +610,16 @@ class PackedAttentionMoT(nn.Module):
         """
 
         q_und_in = self.q_proj(get_und_seq(pack))  # [N_und,num_heads*head_dim]
-        q_gen_in = self.q_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_heads*head_dim]
-
         k_und_in = self.k_proj(get_und_seq(pack))  # [N_und,num_kv_heads*head_dim]
-        k_gen_in = self.k_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_kv_heads*head_dim]
-
         v_und_in = self.v_proj(get_und_seq(pack))  # [N_und,num_kv_heads*head_dim]
-        v_gen_in = self.v_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_kv_heads*head_dim]
+
+        qkv_proj_moe_gen = getattr(self, "qkv_proj_moe_gen", None)
+        if qkv_proj_moe_gen is None:
+            q_gen_in = self.q_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_heads*head_dim]
+            k_gen_in = self.k_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_kv_heads*head_dim]
+            v_gen_in = self.v_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_kv_heads*head_dim]
+        else:
+            q_gen_in, k_gen_in, v_gen_in = qkv_proj_moe_gen(get_gen_seq(pack))
 
         q_und = q_und_in.view(-1, self.num_attention_heads, self.head_dim)  # [N_und,num_heads,head_dim]
         k_und = k_und_in.view(-1, self.num_key_value_heads, self.head_dim)  # [N_und,num_kv_heads,head_dim]

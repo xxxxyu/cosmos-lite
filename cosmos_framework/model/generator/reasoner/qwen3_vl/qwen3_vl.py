@@ -516,7 +516,13 @@ class Qwen3VLTextMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate_up_proj = getattr(self, "gate_up_proj", None)
+        if gate_up_proj is None:
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+        else:
+            gate, up = gate_up_proj(x)
+        down_proj = self.down_proj(self.act_fn(gate) * up)
         return down_proj
 
 
