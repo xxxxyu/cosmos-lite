@@ -152,7 +152,8 @@ lazily. See the [RoboLab Edge benchmark and deployment record](examples/robolab_
   - [ ] Stronger calibration and task-aware precision selection
 - [ ] Runtime and deployment
   - [x] Streaming export and self-contained 24GB RTX 4090 deployment
-  - [ ] Kernel and model-level inference acceleration
+  - [x] RTX 4090 compile, projection fusion, and shape-aware attention
+  - [ ] More GPU architectures and inference backends
 - [ ] Evaluation and robotics
   - [x] RoboLab and RoboCasa365 replay, profiling, and rollout
   - [ ] More simulation environments

@@ -18,21 +18,32 @@ path and rejected CUDA Graph variants are documented in the
 recommendations below remain W4A16/W8A16 pending release review and bundle
 distribution.
 
+RTX 4090 shape-aware attention, FP8 kernel profiling, and condition-cache
+results are documented in the [SM89 optimization report](SM89_OPTIMIZATION.md).
+
 For experimental GenW8A8 deployment on RTX 4090, the validated training-free
-runtime optimization is:
+Nano runtime optimization is:
 
 ```bash
 TORCH_COMPILE=1 \
 COMPILED_REGION=language \
 COMPILE_DYNAMIC=1 \
 FP8_PROJECTION_FUSION=shared \
+SAGE_ATTENTION=1 \
+CONDITION_KV_CACHE=1 \
 BUNDLE_DIR=/path/to/gen_w8a8_bundle \
 examples/robolab_quant/pipeline.sh serve
 ```
 
 Issue one warmup request before control starts. Projection sharing requires an
 FP8 bundle and is rejected when shape recording or online calibration-stat
-collection is enabled.
+collection is enabled. Install the optional SM89 backend first with
+`examples/quantized_robot_policy/install_sage_attention.sh`.
+
+The stable Edge profile uses the same compile and projection settings but
+omits `SAGE_ATTENTION` and `CONDITION_KV_CACHE`. Edge Sage reaches 386ms p50,
+but its 50-rollout success estimate was 68% versus the 74% FlashAttention2
+baseline. See the SM89 report before opting into that latency/quality tradeoff.
 
 ## 1. Setup
 
