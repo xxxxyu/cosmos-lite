@@ -21,8 +21,9 @@ distribution.
 RTX 4090 shape-aware attention, FP8 kernel profiling, and condition-cache
 results are documented in the [SM89 optimization report](SM89_OPTIMIZATION.md).
 
-For experimental GenW8A8 deployment on RTX 4090, the validated training-free
-Nano runtime optimization is:
+For experimental GenW8A8 deployment on RTX 4090, use the validated profile for
+the corresponding model family. Nano uses shape-aware SageAttention and the
+request-local condition cache while retaining vLLM CUTLASS FP8 GEMM:
 
 ```bash
 TORCH_COMPILE=1 \
@@ -35,15 +36,30 @@ BUNDLE_DIR=/path/to/gen_w8a8_bundle \
 examples/robolab_quant/pipeline.sh serve
 ```
 
+Edge retains FlashAttention2 and uses the shape-tuned SM89 FP8 GEMM:
+
+```bash
+TORCH_COMPILE=1 \
+COMPILED_REGION=language \
+COMPILE_DYNAMIC=1 \
+FP8_PROJECTION_FUSION=shared \
+FP8_GEMM_BACKEND=triton_sm89 \
+BUNDLE_DIR=/path/to/edge_gen_w8a8_bundle \
+examples/robolab_quant/pipeline.sh serve
+```
+
 Issue one warmup request before control starts. Projection sharing requires an
 FP8 bundle and is rejected when shape recording or online calibration-stat
 collection is enabled. Install the optional SM89 backend first with
 `examples/quantized_robot_policy/install_sage_attention.sh`.
 
-The stable Edge profile uses the same compile and projection settings but
-omits `SAGE_ATTENTION` and `CONDITION_KV_CACHE`. Edge Sage reaches 386ms p50,
-but its 50-rollout success estimate was 68% versus the 74% FlashAttention2
-baseline. See the SM89 report before opting into that latency/quality tradeoff.
+The SM89 Triton backend recognizes only the validated Edge Gen shapes and
+falls back to CUTLASS for all other shapes. It improved Edge request p50 by
+8.4% and passed the paired 50-rollout quality gate. Nano Triton improved
+request p50 by 8.7%, but its success-rate point estimate fell from 98% to 94%;
+those Nano shapes are intentionally excluded from the production backend.
+Edge Sage remains experimental because its estimate was 68% versus the 74%
+FlashAttention2 baseline. See the SM89 report for the full evidence.
 
 ## 1. Setup
 

@@ -34,8 +34,8 @@ the independent-Linear path.
 ## Replay32
 
 Protocol: DROID train128 captured requests, guidance 3, two UniPC steps, seed
-0, 32x8 actions, and one RTX 4090-NX-1 GPU per server. Request latency excludes
-RoboLab simulation. Peak memory is CUDA reserved memory.
+0, 32x8 actions, and one RTX 4090 GPU per server on an eight-GPU host. Request
+latency excludes RoboLab simulation. Peak memory is CUDA reserved memory.
 
 | Model | Runtime | Request p50/p95 (ms) | Generate p50 (ms) | Speedup | Peak (GB) | L1 vs eager | Sample Linf p95 |
 |---|---|---:|---:|---:|---:|---:|---:|

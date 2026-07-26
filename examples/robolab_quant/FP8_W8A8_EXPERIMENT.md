@@ -65,9 +65,10 @@ that branch.
 
 ## Nano Replay32
 
-Protocol: the same 32 captured DROID train requests, RTX 4090-NX-1, guidance 3,
-two UniPC steps, deterministic seed 0, and 32x8 actions. Latency is policy
-request latency and excludes RoboLab simulation. The first request is retained,
+Protocol: the same 32 captured DROID train requests, one RTX 4090 on an
+eight-GPU host, guidance 3, two UniPC steps, deterministic seed 0, and 32x8
+actions. Latency is policy request latency and excludes RoboLab simulation. The
+first request is retained,
 but does not affect the median materially.
 
 | Candidate | Request p50/p95 (ms) | Generate p50 (ms) | Peak alloc/reserved (GB) | L1 mean | Element error p95 | Sample Linf p95 |

@@ -34,12 +34,34 @@ with a 98.96% L2 hit rate. No eligible warp accounted for 90.27% of scheduler
 cycles.
 
 The kernel is resource and latency limited rather than Tensor Core or DRAM
-bandwidth limited. A lower-register, lower-shared-memory SM89 tile may improve
-it, but vLLM does not expose a runtime tile selector for this operation. The
-PyTorch cuBLASLt `torch._scaled_mm` path was 3-4x slower on the policy shapes.
-The release therefore retains the mature vLLM CUTLASS kernel and the existing
-shared activation quantization. A new custom GEMM is not justified by the
-available evidence.
+bandwidth limited. vLLM does not expose a runtime tile selector for this
+operation, and PyTorch cuBLASLt `torch._scaled_mm` was 3-4x slower on the
+policy shapes. A shape-tuned Triton implementation was therefore compared with
+the same packed E4M3 weights, per-token activation scales, per-channel weight
+scales, BF16 output, and compiled call boundary:
+
+| Model | M x K x N | Compiled CUTLASS (ms) | Compiled Triton (ms) | Reduction |
+| --- | --- | ---: | ---: | ---: |
+| Edge | 3093 x 2048 x 9216 | 0.569 | **0.407** | **28.6%** |
+| Edge | 3093 x 2048 x 2048 | 0.165 | **0.111** | **32.8%** |
+| Edge | 3093 x 2048 x 1024 | 0.245 | **0.075** | **69.6%** |
+| Edge | 3093 x 9216 x 2048 | 0.629 | **0.532** | **15.4%** |
+| Nano | 3093 x 4096 x 12288 | 1.266 | **1.091** | **13.8%** |
+| Nano | 3093 x 4096 x 4096 | 0.498 | **0.383** | **23.1%** |
+| Nano | 3093 x 4096 x 1024 | 0.148 | **0.130** | **12.4%** |
+| Nano | 3093 x 12288 x 4096 | 1.317 | **1.168** | **11.4%** |
+
+The Nano rows demonstrate operator-level potential but are not enabled in the
+production backend. The optional `triton_sm89` backend selects only the four
+Edge shapes above and falls back to CUTLASS otherwise. This restriction was
+made after the Nano closed-loop candidate produced an unfavorable success-rate
+point estimate, as detailed below.
+
+The backend is implemented as a PyTorch `triton_op`, so Inductor can trace the
+kernel launch instead of treating the GEMM as an opaque vLLM custom op. The
+server consequently requires both SM89 and `TORCH_COMPILE=1`; eager Triton
+dispatch is not a supported deployment mode. Bundle weights and manifests are
+unchanged.
 
 ### Shape-Aware Attention
 
@@ -77,6 +99,21 @@ The implementation is opt-in and limited to batch-one, two-way, non-CP
 inference. Unsupported modes fail explicitly. Cache storage adds about 15 MB
 of reserved memory on Nano and does not affect the 24 GB deployment gate.
 
+### Rejected CFG Batching
+
+A single-GPU prototype packed the conditional and unconditional CFG branches
+into one two-sample forward. On Edge replay32 it increased request p50 from
+517.4ms to 555.5ms and generate p50 from 414.6ms to 467.7ms. Peak reserved
+memory was unchanged because the existing reservation covered the temporary
+batch.
+
+The long Gen GEMMs already have M=3093 for each branch. Batching doubles M and
+FLOPs without removing model work, while changing two-way attention from its
+dense batch-one path to varlen packed attention. A padded dense batch-two path
+could recover part of the attention penalty but has no credible large speedup
+ceiling because the Gen GEMMs dominate. The prototype was therefore rolled
+back rather than exposed as a runtime option.
+
 ## Replay Results
 
 Steady request latency excludes the first lazy compile request. All rows use
@@ -106,6 +143,24 @@ projection settings with FlashAttention2.
 | Nano | FlashAttention2 baseline | 1126.9 / 1133.1 | 1124.5 / 1130.9 | 15.50 |
 | Nano | shape-aware Sage + cache | **987.2 / 992.3** | **984.6 / 989.7** | 15.51 |
 
+The FP8 GEMM backend was then isolated while holding each model's selected
+attention/cache profile constant. These replay32 runs were performed on an
+otherwise idle RTX 4090:
+
+| Model | FP8 GEMM | Request p50/p95 (ms) | Generate p50/p95 (ms) | Peak reserved (GB) |
+| --- | --- | ---: | ---: | ---: |
+| Edge | CUTLASS | 479.8 / - | 414.6 / - | 8.79 |
+| Edge | tuned Triton | **439.4 / -** | **378.9 / -** | 8.79 |
+| Nano | CUTLASS | 1054.8 / 1087.6 | 997.6 / 1020.1 | 15.51 |
+| Nano | tuned Triton candidate | **963.4 / 1014.3** | **904.6 / 921.9** | 15.51 |
+
+The tuned kernel reduced Edge request/generate p50 by 8.4%/8.6% and Nano by
+8.7%/9.3%. Missing Edge p95 values were not retained and are not inferred.
+The Nano action diagnostic over 32 DROID captures was `L1 mean=0.036226`,
+`L1 p95=0.073842`, `Linf p95=0.436517`, and `Linf max=0.490726`. These open-loop
+differences required closed-loop gating; operator speed alone was insufficient
+for promotion.
+
 The cache changes the compiled graph and therefore floating reduction order.
 Against the no-cache decomposed-Sage output, replay8 measured Edge
 `L1=0.02186 / Linf p95=0.16125` and Nano
@@ -125,6 +180,8 @@ model family.
 | Nano | FlashAttention2 baseline | 49/50 = 98% [89.5%, 99.6%] | reference | - |
 | Nano | shape-aware Sage | 46/50 = 92% [81.2%, 96.8%] | 1/4 | 0.375 |
 | Nano | shape-aware Sage + cache | **49/50 = 98% [89.5%, 99.6%]** | 1/1 | 1.000 |
+| Edge | tuned Triton, FlashAttention2 | **39/50 = 78% [64.8%, 87.2%]** | 12/10 | 0.832 |
+| Nano | tuned Triton, Sage + cache | 47/50 = 94% [83.8%, 97.9%] | 1/3 | 0.625 |
 
 The Edge difference is not statistically significant at this sample size, but
 its six-point lower estimate is unfavorable. Sage therefore remains an
@@ -133,6 +190,15 @@ Sage plus the condition cache matches the baseline aggregate and has only two
 discordant paired outcomes, so it is the validated Nano low-latency profile.
 The cache alone is not claimed to improve quality: its 49/50 result versus
 46/50 without cache has McNemar `p=0.375`.
+
+Edge tuned Triton passed the conservative gate: its point estimate improved by
+four points, confidence intervals overlap, and paired testing found no evidence
+of a systematic regression. Nano tuned Triton was rejected despite the
+non-significant test because its point estimate fell by four points, with three
+baseline-only wins and one candidate-only win. The sample does not prove a
+regression, but it also does not justify replacing a stable 98% profile. Nano
+kernel measurements remain documented for future numerical or quality work;
+the runtime shape allowlist excludes them.
 
 ## Deployment Notes
 
@@ -148,8 +214,9 @@ CUDA, GPU, and model environment. Production services should monitor the
 `server_ready` and request events in `profile.jsonl`; they record compile,
 Sage-request, cache, memory, and latency settings.
 
-For Nano, enable both `SAGE_ATTENTION=1` and `CONDITION_KV_CACHE=1`. For Edge,
-omit both for the stable profile; `SAGE_ATTENTION=1` is available when the
-latency target outweighs the unresolved closed-loop point-estimate risk.
-Removing both variables is the complete rollback and does not require
-repacking the model.
+For Nano, enable both `SAGE_ATTENTION=1` and `CONDITION_KV_CACHE=1`, and leave
+`FP8_GEMM_BACKEND` unset so CUTLASS remains active. For Edge, omit Sage/cache
+and set `FP8_GEMM_BACKEND=triton_sm89`. Edge rollback consists only of removing
+that variable. `SAGE_ATTENTION=1` remains an Edge opt-in when the latency target
+outweighs its unresolved closed-loop point-estimate risk. No profile change
+requires repacking the model.

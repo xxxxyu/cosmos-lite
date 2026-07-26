@@ -124,6 +124,7 @@ def _gptq_uint4b8_quantize_vllm_compatible(
     q_weight = q_weight + 8
 
     if grouped_layout:
+
         def restore(t: torch.Tensor) -> torch.Tensor:
             return t.reshape((group_size, -1, size_n)).permute(1, 0, 2).reshape((size_k, size_n)).contiguous()
 
@@ -336,9 +337,7 @@ class VllmCutlassFp8W8A8Linear(nn.Module):
         capability = torch.cuda.get_device_capability(weight.device)
         capability_int = capability[0] * 10 + capability[1]
         if capability_int < 89 or not ops.cutlass_scaled_mm_supports_fp8(capability_int):
-            raise RuntimeError(
-                f"vLLM CUTLASS FP8 W8A8 requires native FP8 support (SM89+), got SM{capability_int}"
-            )
+            raise RuntimeError(f"vLLM CUTLASS FP8 W8A8 requires native FP8 support (SM89+), got SM{capability_int}")
 
         self.size_n, self.size_k = weight.shape
         self.num_bits = 8
@@ -376,6 +375,12 @@ class VllmCutlassFp8W8A8Linear(nn.Module):
         return self._ops().scaled_fp8_quant(x_2d, use_per_token_if_dynamic=True)
 
     def forward_quantized(self, q_x: torch.Tensor, scale_a: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "gemm_backend", "cutlass") == "triton_sm89":
+            from cosmos_framework.scripts import sm89_fp8_gemm
+
+            qweight = self.qweight_nk.t()
+            if sm89_fp8_gemm.supports_shape(q_x, qweight):
+                return sm89_fp8_gemm.scaled_mm(q_x, qweight, scale_a, self.scale_b)
         return self._ops().cutlass_scaled_mm(
             q_x,
             self.qweight_nk.t(),
@@ -754,7 +759,9 @@ def main() -> None:
     parser.add_argument("--in-features", type=int, default=4096)
     parser.add_argument("--out-features", type=int, default=12288)
     parser.add_argument("--shape-file", default="", help="Optional JSONL from COSMOS3_LINEAR_SHAPES_JSONL.")
-    parser.add_argument("--max-shapes", type=int, default=16, help="Top shape groups to benchmark when --shape-file is set.")
+    parser.add_argument(
+        "--max-shapes", type=int, default=16, help="Top shape groups to benchmark when --shape-file is set."
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)

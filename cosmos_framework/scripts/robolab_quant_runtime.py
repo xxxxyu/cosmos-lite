@@ -121,6 +121,7 @@ def _make_backend(
     metadata: dict[str, Any],
     payload: dict[str, Any],
     device: torch.device,
+    fp8_gemm_backend: str = "cutlass",
 ) -> nn.Module:
     backend_class = str(metadata["backend_class"])
     if backend_class == "VllmGptqMarlinW4A16Linear":
@@ -141,6 +142,8 @@ def _make_backend(
         capability_int = capability[0] * 10 + capability[1]
         if capability_int < 89 or not ops.cutlass_scaled_mm_supports_fp8(capability_int):
             raise RuntimeError(f"FP8 W8A8 bundle requires native FP8 support (SM89+), got SM{capability_int}")
+        if fp8_gemm_backend == "triton_sm89" and capability_int != 89:
+            raise RuntimeError(f"Tuned Triton FP8 GEMM requires SM89, got SM{capability_int}")
         backend = cls.__new__(cls)
         nn.Module.__init__(backend)
         backend.size_k = int(metadata["size_k"])
@@ -148,8 +151,11 @@ def _make_backend(
         backend.num_bits = 8
         backend.activation_bits = 8
         backend.fp8_max = 448.0
+        backend.gemm_backend = fp8_gemm_backend
         backend.register_buffer(
-            "qweight_nk", payload["qweight_nk"].to(device=device, dtype=torch.float8_e4m3fn).contiguous(), persistent=False
+            "qweight_nk",
+            payload["qweight_nk"].to(device=device, dtype=torch.float8_e4m3fn).contiguous(),
+            persistent=False,
         )
         backend.register_buffer(
             "scale_b", payload["scale_b"].to(device=device, dtype=torch.float32).contiguous(), persistent=False
@@ -190,13 +196,22 @@ def _make_backend(
 class RobolabDirectQuantLoader:
     """Process-lifetime patch that replaces Linear modules before CUDA materialization."""
 
-    def __init__(self, bundle_dir: str | Path, *, fp8_projection_fusion: str = "none") -> None:
+    def __init__(
+        self,
+        bundle_dir: str | Path,
+        *,
+        fp8_projection_fusion: str = "none",
+        fp8_gemm_backend: str = "cutlass",
+    ) -> None:
         self.root = Path(bundle_dir).expanduser().resolve()
         self.validation = validate_robolab_quant_bundle(self.root)
         self.manifest = self.validation["manifest"]
         if fp8_projection_fusion not in {"none", "shared"}:
             raise ValueError(f"Unsupported FP8 projection fusion mode: {fp8_projection_fusion!r}")
         self.fp8_projection_fusion = fp8_projection_fusion
+        if fp8_gemm_backend not in {"cutlass", "triton_sm89"}:
+            raise ValueError(f"Unsupported FP8 GEMM backend: {fp8_gemm_backend!r}")
+        self.fp8_gemm_backend = fp8_gemm_backend
         self.fp8_projection_groups: dict[str, int] = {"qkv": 0, "gate_up": 0}
         self._applied = False
         self._original_from_pretrained: Any = None
@@ -215,8 +230,7 @@ class RobolabDirectQuantLoader:
         group_cls = backend_module.VllmCutlassFp8ProjectionGroup
         for module in list(network.modules()):
             qkv_wrappers = [
-                getattr(module, name, None)
-                for name in ("q_proj_moe_gen", "k_proj_moe_gen", "v_proj_moe_gen")
+                getattr(module, name, None) for name in ("q_proj_moe_gen", "k_proj_moe_gen", "v_proj_moe_gen")
             ]
             qkv_backends = [self._fp8_backend(wrapper, backend_cls) for wrapper in qkv_wrappers]
             if all(backend is not None for backend in qkv_backends):
@@ -248,7 +262,13 @@ class RobolabDirectQuantLoader:
             name = str(metadata["name"])
             set_name = name.removeprefix("net.")
             payload = torch.load(self.root / str(metadata["tensor_file"]), map_location="cpu", weights_only=True)
-            backend = _make_backend(backend_module, metadata, payload, device)
+            backend = _make_backend(
+                backend_module,
+                metadata,
+                payload,
+                device,
+                fp8_gemm_backend=self.fp8_gemm_backend,
+            )
             bias = payload.get("bias")
             wrapped = QuantLinearWithOptionalBias(
                 backend,

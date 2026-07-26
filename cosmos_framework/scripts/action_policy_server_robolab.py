@@ -402,6 +402,8 @@ class RobolabServerArgs(pydantic.BaseModel):
     """Use symbolic-shape compiled MoT kernels. Required for varying policy prompt lengths."""
     fp8_projection_fusion: Literal["none", "shared"] = "none"
     """Share FP8 activation quantization across eligible QKV and gated-MLP projections."""
+    fp8_gemm_backend: Literal["cutlass", "triton_sm89"] = "cutlass"
+    """FP8 GEMM backend; the tuned Triton path supports validated Edge Gen shapes on SM89."""
     condition_kv_cache: bool = False
     """Reuse invariant understanding K/V across denoising steps (experimental, batch size 1)."""
 
@@ -450,6 +452,8 @@ class RobolabPolicyService:
             raise ValueError("FP8 projection fusion is incompatible with COSMOS3_LINEAR_SHAPES_JSONL")
         if args.fp8_projection_fusion != "none" and args.calibration_stats_output is not None:
             raise ValueError("FP8 projection fusion is incompatible with online calibration-stat collection")
+        if args.fp8_gemm_backend == "triton_sm89" and not args.use_torch_compile:
+            raise ValueError("The tuned SM89 Triton FP8 backend requires --use-torch-compile")
         load_start = time.perf_counter()
         self._profile_jsonl = args.profile_jsonl.expanduser().resolve() if args.profile_jsonl is not None else None
         self._quant_loader: RobolabDirectQuantLoader | None = None
@@ -467,6 +471,7 @@ class RobolabPolicyService:
             self._quant_loader = RobolabDirectQuantLoader(
                 quant_root,
                 fp8_projection_fusion=args.fp8_projection_fusion,
+                fp8_gemm_backend=args.fp8_gemm_backend,
             )
             self._quant_loader.install()
             _write_profile_event(
@@ -478,6 +483,7 @@ class RobolabPolicyService:
                 residual_state_keys=validation["residual_state_keys"],
                 bundle_bytes=validation["bundle_bytes"],
                 fp8_projection_fusion=args.fp8_projection_fusion,
+                fp8_gemm_backend=args.fp8_gemm_backend,
             )
         else:
             resolved_checkpoint_path = _resolve_checkpoint_path(args.checkpoint_path, hf_revision=args.hf_revision)
@@ -576,6 +582,7 @@ class RobolabPolicyService:
             compiled_region=args.compiled_region,
             compile_dynamic=args.compile_dynamic,
             fp8_projection_fusion=args.fp8_projection_fusion,
+            fp8_gemm_backend=args.fp8_gemm_backend,
             sage_attention_requested=os.environ.get("COSMOS3_SAGE_ATTENTION", "0") == "1",
             condition_kv_cache=args.condition_kv_cache,
             fp8_projection_groups=(

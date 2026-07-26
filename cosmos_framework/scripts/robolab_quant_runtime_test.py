@@ -83,3 +83,10 @@ def test_loader_installs_compatible_fp8_projection_groups() -> None:
     assert isinstance(network.mlp.gate_proj, torch.nn.Identity)
     assert isinstance(network.mlp.up_proj, torch.nn.Identity)
     assert loader.fp8_projection_groups == {"qkv": 1, "gate_up": 1}
+
+
+def test_direct_loader_rejects_unknown_fp8_gemm_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(runtime, "validate_robolab_quant_bundle", lambda _root: {"manifest": {}})
+
+    with pytest.raises(ValueError, match="Unsupported FP8 GEMM backend"):
+        runtime.RobolabDirectQuantLoader(tmp_path, fp8_gemm_backend="unknown")
