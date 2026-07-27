@@ -11,7 +11,7 @@ streaming low-bit quantization, packed Marlin inference, self-contained
 artifacts, and reproducible RoboLab and RoboCasa365 evaluation pipelines for
 [NVIDIA Cosmos Framework](https://github.com/NVIDIA/Cosmos-Framework).
 
-**[Models](#prebuilt-models) | [RoboLab Nano benchmark](examples/robolab_quant/NANO_BENCHMARKS.md) | [RoboLab Edge benchmark](examples/robolab_quant/EDGE_BENCHMARKS.md) | [RoboCasa365 benchmark](examples/robocasa365_quant/BENCHMARKS.md) | [Setup](#setup) | [Roadmap](#roadmap)**
+**[Models](#prebuilt-models) | [Optimization report](docs/cosmos_lite_optimization_report.md) | [RoboLab Nano benchmark](examples/robolab_quant/NANO_BENCHMARKS.md) | [RoboLab Edge benchmark](examples/robolab_quant/EDGE_BENCHMARKS.md) | [RoboCasa365 benchmark](examples/robocasa365_quant/BENCHMARKS.md) | [Setup](#setup) | [Roadmap](#roadmap)**
 
 ## News
 
