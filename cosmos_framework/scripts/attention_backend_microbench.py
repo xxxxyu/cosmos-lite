@@ -58,10 +58,34 @@ def main() -> None:
     v = torch.randn(shape_kv, device=device, dtype=torch.bfloat16, generator=generator)
 
     from flash_attn import flash_attn_func
-    from sageattention import sageattn_qk_int8_pv_fp8_cuda
+    from flashinfer import single_prefill_with_kv_cache
+    from sageattention import sageattn_qk_int8_pv_fp8_cuda, sageattn_qk_int8_pv_fp16_cuda
 
     backends: dict[str, Callable[[], torch.Tensor]] = {
         "flash2": lambda: flash_attn_func(q, k, v, causal=args.causal),
+        "flashinfer_auto": lambda: single_prefill_with_kv_cache(
+            q[0],
+            k[0],
+            v[0],
+            causal=args.causal,
+            kv_layout="NHD",
+        ).unsqueeze(0),
+        "sage_fp16_fp32": lambda: sageattn_qk_int8_pv_fp16_cuda(
+            q,
+            k,
+            v,
+            tensor_layout="NHD",
+            is_causal=args.causal,
+            pv_accum_dtype="fp32",
+        ),
+        "sage_fp16_fp16+fp32": lambda: sageattn_qk_int8_pv_fp16_cuda(
+            q,
+            k,
+            v,
+            tensor_layout="NHD",
+            is_causal=args.causal,
+            pv_accum_dtype="fp16+fp32",
+        ),
         "sage_fp8_fp32+fp32": lambda: sageattn_qk_int8_pv_fp8_cuda(
             q,
             k,

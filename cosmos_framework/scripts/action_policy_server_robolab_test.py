@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -87,6 +88,7 @@ def test_server_args_default_to_released_droid_serving_config() -> None:
     assert args.fp8_projection_fusion == "none"
     assert args.fp8_gemm_backend == "cutlass"
     assert args.condition_kv_cache is False
+    assert args.sparse_video_transform is True
     assert args.vae_encode_chunk_frames == 8
     assert args.hf_revision == "main"
     assert args.domain_name == "droid_lerobot"
@@ -149,6 +151,59 @@ def test_joint_pos_observation_preprocessing_matches_internal_layout() -> None:
     np.testing.assert_allclose(sample["history_action"][0].numpy(), np.concatenate([joint_position[0], [0.8]]))
     assert sample["ai_caption"] == "open the drawer"
     assert sample["viewpoint"] == "concat_view"
+
+
+def test_sparse_policy_video_transform_matches_full_video_transform() -> None:
+    config = robolab_server.RobolabPolicyConfig(
+        checkpoint_path="unused",
+        domain_name="droid_lerobot",
+        decode_video=False,
+        seed=0,
+        deterministic_seed=True,
+        guidance=3.0,
+        num_steps=2,
+        shift=5.0,
+        conditioning_fps=15.0,
+        resolution="256",
+        action_chunk_size=4,
+        action_dim=8,
+        image_height=4,
+        image_width=5,
+        action_space="joint_pos",
+        use_state=True,
+        history_length=1,
+    )
+    obs = {
+        "prompt": "open the drawer",
+        "observation/image": np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3),
+        "observation/joint_position": np.arange(7, dtype=np.float32),
+        "observation/gripper_position": np.array([0.25], dtype=np.float32),
+    }
+    fast_pipeline = robolab_server.ActionTransformPipeline(max_action_dim=64, cfg_dropout_rate=0.0)
+    legacy_pipeline = robolab_server.ActionTransformPipeline(max_action_dim=64, cfg_dropout_rate=0.0)
+    fast_service = object.__new__(robolab_server.RobolabPolicyService)
+    fast_service.cfg = config
+    fast_service._transform = fast_pipeline
+    legacy_service = object.__new__(robolab_server.RobolabPolicyService)
+    legacy_service.cfg = config
+    legacy_service._transform = lambda sample, resolution: legacy_pipeline(sample, resolution)
+    rollback_service = object.__new__(robolab_server.RobolabPolicyService)
+    rollback_service.cfg = replace(config, sparse_video_transform=False)
+    rollback_service._transform = robolab_server.ActionTransformPipeline(max_action_dim=64, cfg_dropout_rate=0.0)
+
+    fast = robolab_server.RobolabPolicyService._build_sample(fast_service, obs)
+    legacy = robolab_server.RobolabPolicyService._build_sample(legacy_service, obs)
+    rollback = robolab_server.RobolabPolicyService._build_sample(rollback_service, obs)
+
+    assert fast.keys() == legacy.keys()
+    for key, expected in legacy.items():
+        actual = fast[key]
+        if isinstance(expected, torch.Tensor):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(rollback[key], expected, rtol=0, atol=0)
+        else:
+            assert actual == expected
+            assert rollback[key] == expected
 
 
 def test_build_data_batch_wraps_multi_item_keys_like_internal_server() -> None:

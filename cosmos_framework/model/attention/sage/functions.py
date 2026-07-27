@@ -4,13 +4,20 @@
 
 """SageAttention adapter for heads-last Cosmos tensors."""
 
+import os
+
 import torch
 from sageattention import _fused
-from sageattention.core import per_thread_int8_triton, sm89_compile
+from sageattention.core import per_thread_int8_triton, sm80_compile, sm89_compile
 from torch import Tensor
 
 from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.attention.sage.checks import sage_attention_check
+
+_SAGE_PV_MODE = os.environ.get("COSMOS3_SAGE_PV", "fp8_fp32_fp32")
+_SAGE_PV_MODES = {"fp16_fp32", "fp8_fp32_fp32"}
+if _SAGE_PV_MODE not in _SAGE_PV_MODES:
+    raise ValueError(f"Unsupported COSMOS3_SAGE_PV={_SAGE_PV_MODE!r}; expected one of {sorted(_SAGE_PV_MODES)}")
 
 
 @torch.library.custom_op("cosmos_lite::sage_transpose_pad_permute", mutates_args=("output",), device_types="cuda")
@@ -50,6 +57,23 @@ def _sage_attention_sm89(query: Tensor, key: Tensor, value: Tensor, scale: float
         BLKK=64,
         WARPK=64,
     )
+    output = torch.empty_like(query)
+    if _SAGE_PV_MODE == "fp16_fp32":
+        value_fp16 = value.to(torch.float16)
+        sm80_compile.qk_int8_sv_f16_accum_f32_attn(
+            q_int8,
+            k_int8,
+            value_fp16,
+            output,
+            q_scale,
+            k_scale,
+            0,  # NHD
+            0,  # non-causal
+            3,  # per-thread Q/K quantization
+            scale,
+            0,  # no LSE output
+        )
+        return output
     batch, sequence_length, kv_heads, head_dim = value.shape
     padded_length = (sequence_length + 63) // 64 * 64
     value_permuted = torch.empty(
@@ -61,7 +85,6 @@ def _sage_attention_sm89(query: Tensor, key: Tensor, value: Tensor, scale: float
     value_fp8 = torch.empty_like(value_permuted, dtype=torch.float8_e4m3fn)
     value_scale = torch.empty((batch, kv_heads, head_dim), dtype=torch.float32, device=value.device)
     _scale_fuse_quant(value_permuted, value_fp8, value_scale, sequence_length)
-    output = torch.empty_like(query)
     sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
         q_int8,
         k_int8,

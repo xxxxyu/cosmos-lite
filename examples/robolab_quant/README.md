@@ -36,7 +36,8 @@ BUNDLE_DIR=/path/to/gen_w8a8_bundle \
 examples/robolab_quant/pipeline.sh serve
 ```
 
-Edge retains FlashAttention2 and uses the shape-tuned SM89 FP8 GEMM:
+Edge uses the higher-fidelity Sage FP16-PV mode with the shape-tuned SM89 FP8
+GEMM:
 
 ```bash
 TORCH_COMPILE=1 \
@@ -44,6 +45,8 @@ COMPILED_REGION=language \
 COMPILE_DYNAMIC=1 \
 FP8_PROJECTION_FUSION=shared \
 FP8_GEMM_BACKEND=triton_sm89 \
+SAGE_ATTENTION=1 \
+SAGE_PV=fp16_fp32 \
 BUNDLE_DIR=/path/to/edge_gen_w8a8_bundle \
 examples/robolab_quant/pipeline.sh serve
 ```
@@ -53,13 +56,21 @@ FP8 bundle and is rejected when shape recording or online calibration-stat
 collection is enabled. Install the optional SM89 backend first with
 `examples/quantized_robot_policy/install_sage_attention.sh`.
 
+The server resizes only the observed frame and directly allocates zero future
+frames at target resolution. This bit-equivalent CPU data-path optimization is
+enabled by default; set `SPARSE_VIDEO_TRANSFORM=0` to restore the legacy
+full-video transform for diagnosis or a custom integration.
+
 The SM89 Triton backend recognizes only the validated Edge Gen shapes and
 falls back to CUTLASS for all other shapes. It improved Edge request p50 by
 8.4% and passed the paired 50-rollout quality gate. Nano Triton improved
 request p50 by 8.7%, but its success-rate point estimate fell from 98% to 94%;
 those Nano shapes are intentionally excluded from the production backend.
-Edge Sage remains experimental because its estimate was 68% versus the 74%
-FlashAttention2 baseline. See the SM89 report for the full evidence.
+Edge Sage FP8-PV remains experimental because its estimate was 68% versus the
+74% FlashAttention2 baseline. The promoted higher-fidelity FP16-PV
+mode reached 80% versus 78% for the matched Triton+FlashAttention2 baseline
+and reduced request p50 from 349.7 ms to 331.4 ms. See the SM89 report for the
+full evidence.
 
 ## 1. Setup
 

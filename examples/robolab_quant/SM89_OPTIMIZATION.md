@@ -23,6 +23,38 @@ but did not produce a repeatable Edge latency reduction.
 
 ## Operator Findings
 
+### Request Data Path
+
+The original request timer was checked against CUDA Events around
+`generate_samples_from_batch`; the following action transfer synchronizes the
+stream before event elapsed time is read. The comparison showed that the host
+timer already tracked CUDA time closely in this workload. On an idle RTX 4090,
+the Edge Triton profile separated request latency into 36.64 ms of sample
+construction and 338.35 ms of CUDA generation, for a 375.96 ms in-process
+request p50 and 382.84 ms WebSocket p50.
+
+Policy inputs contain one observed RGB frame followed by 32 known zero future
+frames. The default sparse transform resizes only the observed frame and then
+allocates future zeros directly at the target resolution. It preserves the
+existing `ActionTransformPipeline` output exactly, including `image_size`
+metadata, while reducing sample construction from 36.64 to 2.31 ms:
+
+| Edge data path | Build sample p50 (ms) | CUDA generate p50 (ms) | In-process request p50 (ms) | WebSocket p50 (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Full-video transform | 36.64 | 338.35 | 375.96 | 382.84 |
+| **Sparse policy transform** | **2.31** | 339.87 | **342.86** | **349.70** |
+
+Replay32 produced bit-identical action chunks. Custom transform types retain
+the legacy path, and `SPARSE_VIDEO_TRANSFORM=0` is an explicit rollback. This
+is a CPU data-path optimization, not a GEMM or model-graph speedup.
+
+The selected Nano CUTLASS + Sage + condition-cache profile was also rerun over
+32 captures. Sparse preprocessing took 2.45 ms p50, CUDA generation took
+947.65 ms p50, and the in-process/WebSocket request p50 values were 950.93 ms
+and 958.53 ms. The previous full-transform WebSocket p50 was 987.2 ms, so the
+same output-preserving optimization reduced Nano request p50 by 28.7 ms and
+kept it below the 1,000 ms target.
+
 ### FP8 GEMM
 
 The dominant Nano FP8 projection has `M=3093`, `K=4096`, and `N=12288`.
@@ -80,12 +112,31 @@ non-causal attention and Q length at least 512. FlashAttention2 remains active
 for short causal Und attention, other architectures, training, varlen inputs,
 and installations without SageAttention.
 
-The adapter uses Sage's SM89 INT8-QK/FP8-PV kernels with FP32+FP32
-accumulation. SageAttention 2.2.0's default FP32+FP16 SM89 path produced a CUDA
-launch failure in the validated PyTorch 2.10 / CUDA 12.8 environment and is not
-used. The adapter decomposes the Python scheduler so Inductor can compile the
-surrounding graph; only the two upstream pybind quantization operations remain
-small opaque custom ops.
+The adapter defaults to Sage's SM89 INT8-QK/FP8-PV kernels with FP32+FP32
+accumulation. A higher-fidelity INT8-QK/FP16-PV SM80 kernel with FP32
+accumulation is available through `SAGE_PV=fp16_fp32`. The adapter decomposes
+the Python scheduler so Inductor can compile the surrounding graph; only the
+upstream pybind quantization operations remain small opaque custom ops.
+
+The long Edge generation shape was screened against FlashAttention2 before a
+whole-model trial:
+
+| Backend | p50 (ms) | L1 vs FlashAttention2 | Linf vs FlashAttention2 |
+| --- | ---: | ---: | ---: |
+| FlashAttention2 | 0.706 | 0 | 0 |
+| FlashInfer BF16 | 0.725 | 0.0000506 | 0.00098 |
+| Sage INT8-QK, FP16-PV/FP32 | 0.463 | 0.000265 | 0.00342 |
+| Sage INT8-QK, FP16-PV/FP16+FP32 | 0.388 | 0.000258 | 0.00391 |
+| Sage INT8-QK, FP8-PV/FP32+FP32 | **0.324** | 0.000889 | 0.00977 |
+
+FlashInfer was rejected because it did not outperform FlashAttention2. The
+FP16+FP32 Sage variant was rejected after graph integration exposed unsupported
+WARPQ=16 shapes. FP16-PV/FP32 was the only higher-fidelity whole-model rollout
+candidate. With the sparse data path, replay32 measured 331.4 ms request p50,
+versus 349.7 ms for FlashAttention2 and 315.9 ms for FP8-PV Sage. Its action
+error against FlashAttention2 was `L1 mean=0.0227` and `Linf p95=0.2069`, about
+13% and 14% lower than FP8-PV Sage respectively. Closed-loop promotion still
+requires the paired quality gate below.
 
 ### Condition K/V Cache
 
@@ -181,13 +232,14 @@ model family.
 | Nano | shape-aware Sage | 46/50 = 92% [81.2%, 96.8%] | 1/4 | 0.375 |
 | Nano | shape-aware Sage + cache | **49/50 = 98% [89.5%, 99.6%]** | 1/1 | 1.000 |
 | Edge | tuned Triton, FlashAttention2 | **39/50 = 78% [64.8%, 87.2%]** | 12/10 | 0.832 |
+| Edge | tuned Triton, Sage FP16-PV | **40/50 = 80% [67.0%, 88.8%]** | 6/5 vs tuned FA2 | 1.000 |
 | Nano | tuned Triton, Sage + cache | 47/50 = 94% [83.8%, 97.9%] | 1/3 | 0.625 |
 
-The Edge difference is not statistically significant at this sample size, but
-its six-point lower estimate is unfavorable. Sage therefore remains an
-experimental Edge opt-in; the stable Edge profile keeps FlashAttention2. Nano
-Sage plus the condition cache matches the baseline aggregate and has only two
-discordant paired outcomes, so it is the validated Nano low-latency profile.
+The Edge FP8-PV difference is not statistically significant at this sample
+size, but its six-point lower estimate is unfavorable. FP8-PV Sage therefore
+remains an experimental Edge opt-in. Nano Sage plus the condition cache matches
+the baseline aggregate and has only two discordant paired outcomes, so it is
+the validated Nano low-latency profile.
 The cache alone is not claimed to improve quality: its 49/50 result versus
 46/50 without cache has McNemar `p=0.375`.
 
@@ -199,6 +251,13 @@ baseline-only wins and one candidate-only win. The sample does not prove a
 regression, but it also does not justify replacing a stable 98% profile. Nano
 kernel measurements remain documented for future numerical or quality work;
 the runtime shape allowlist excludes them.
+
+The higher-fidelity Edge Sage FP16-PV candidate also passed the conservative
+gate against the promoted Triton+FlashAttention2 baseline. Its point estimate
+improved from 78% to 80%, with six candidate-only and five baseline-only
+successes. The exact McNemar result does not claim a quality improvement, but
+the non-inferior point estimate removes the concern that blocked FP8-PV Sage,
+while request p50 improves by another 18.3 ms.
 
 ## Deployment Notes
 
@@ -215,8 +274,8 @@ CUDA, GPU, and model environment. Production services should monitor the
 Sage-request, cache, memory, and latency settings.
 
 For Nano, enable both `SAGE_ATTENTION=1` and `CONDITION_KV_CACHE=1`, and leave
-`FP8_GEMM_BACKEND` unset so CUTLASS remains active. For Edge, omit Sage/cache
-and set `FP8_GEMM_BACKEND=triton_sm89`. Edge rollback consists only of removing
-that variable. `SAGE_ATTENTION=1` remains an Edge opt-in when the latency target
-outweighs its unresolved closed-loop point-estimate risk. No profile change
-requires repacking the model.
+`FP8_GEMM_BACKEND` unset so CUTLASS remains active. For Edge, set
+`FP8_GEMM_BACKEND=triton_sm89`, `SAGE_ATTENTION=1`, and
+`SAGE_PV=fp16_fp32`; leave the condition cache off. Edge attention rollback
+removes the two Sage variables, while GEMM rollback removes the Triton
+variable. No profile change requires repacking the model.

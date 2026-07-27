@@ -349,6 +349,7 @@ class RobolabPolicyConfig:
     action_space: ActionSpace = "joint_pos"
     use_state: bool = True
     history_length: int = 1
+    sparse_video_transform: bool = True
 
 
 class RobolabServerArgs(pydantic.BaseModel):
@@ -406,6 +407,8 @@ class RobolabServerArgs(pydantic.BaseModel):
     """FP8 GEMM backend; the tuned Triton path supports validated Edge Gen shapes on SM89."""
     condition_kv_cache: bool = False
     """Reuse invariant understanding K/V across denoising steps (experimental, batch size 1)."""
+    sparse_video_transform: bool = True
+    """Resize the observed frame only, then allocate zero future frames at the target resolution."""
 
     seed: int = 0
     """Base generation seed used to initialize the request RNG."""
@@ -522,6 +525,7 @@ class RobolabPolicyService:
             num_steps=int(args.num_steps),
             shift=float(args.shift),
             condition_kv_cache=bool(args.condition_kv_cache),
+            sparse_video_transform=bool(args.sparse_video_transform),
             conditioning_fps=float(
                 args.conditioning_fps or inferred.get("conditioning_fps") or _DEFAULT_CONDITIONING_FPS
             ),
@@ -584,7 +588,9 @@ class RobolabPolicyService:
             fp8_projection_fusion=args.fp8_projection_fusion,
             fp8_gemm_backend=args.fp8_gemm_backend,
             sage_attention_requested=os.environ.get("COSMOS3_SAGE_ATTENTION", "0") == "1",
+            sage_pv=os.environ.get("COSMOS3_SAGE_PV", "fp8_fp32_fp32"),
             condition_kv_cache=args.condition_kv_cache,
+            sparse_video_transform=args.sparse_video_transform,
             fp8_projection_groups=(
                 self._quant_loader.fp8_projection_groups if self._quant_loader is not None else None
             ),
@@ -730,8 +736,14 @@ class RobolabPolicyService:
         if image.shape[:2] != (image_h, image_w):
             image = _resize_rgb_uint8(image, (image_h, image_w))
         t_frames = self.cfg.action_chunk_size + 1
-        video = torch.zeros((3, t_frames, image_h, image_w), dtype=torch.uint8)  # [3,T,H,W]
-        video[:, 0] = torch.from_numpy(image.copy()).permute(2, 0, 1)  # [3,H,W]
+        first_frame = torch.from_numpy(image.copy()).permute(2, 0, 1)  # [3,H,W]
+        spatial_metadata: torch.Tensor | None = None
+        if self.cfg.sparse_video_transform and isinstance(self._transform, ActionTransformPipeline):
+            frame_sample = self._transform.video_resize({"video": first_frame}, self.cfg.resolution)
+            first_frame = frame_sample["video"]
+            spatial_metadata = frame_sample["image_size"]
+        video = torch.zeros((3, t_frames, *first_frame.shape[-2:]), dtype=torch.uint8)  # [3,T,H,W]
+        video[:, 0] = first_frame
 
         use_state_rows = 1 if self.cfg.use_state else 0
         action = torch.zeros(
@@ -785,17 +797,29 @@ class RobolabPolicyService:
         if history_action is not None:
             sample["history_action"] = history_action
         sample = self._transform(sample, self.cfg.resolution)
+        if spatial_metadata is not None:
+            sample["image_size"] = spatial_metadata
         if isinstance(sample.get("ai_caption"), dict):
             sample["ai_caption"] = json.dumps(sample["ai_caption"])
         return sample
 
     def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
         request_start = time.perf_counter()
+        build_sample_start = time.perf_counter()
         sample = self._build_sample(obs)
+        build_sample_ms = (time.perf_counter() - build_sample_start) * 1000.0
+        build_batch_start = time.perf_counter()
         data_batch = _build_data_batch_from_sample(sample)
+        build_batch_ms = (time.perf_counter() - build_batch_start) * 1000.0
         seed = self._next_seed()
         log.info(f"[robolab-policy-server] prompt={data_batch['ai_caption'][0]!r} seed={seed}")
 
+        generate_start_event: torch.cuda.Event | None = None
+        generate_end_event: torch.cuda.Event | None = None
+        if self._profile_jsonl is not None:
+            generate_start_event = torch.cuda.Event(enable_timing=True)
+            generate_end_event = torch.cuda.Event(enable_timing=True)
+            generate_start_event.record()
         generate_start = time.perf_counter()
         with self._lock:
             with torch.inference_mode():
@@ -808,10 +832,20 @@ class RobolabPolicyService:
                     condition_kv_cache=self.cfg.condition_kv_cache,
                 )
         generate_ms = (time.perf_counter() - generate_start) * 1000.0
+        if generate_end_event is not None:
+            generate_end_event.record()
 
         action = samples["action"][0][:, : self.cfg.action_dim]  # [T,D]
         action = action[self.cfg.history_length :]  # [T2,D]
+        action_transfer_start = time.perf_counter()
         action_np = action.detach().cpu().numpy()  # [T2,D]
+        action_transfer_ms = (time.perf_counter() - action_transfer_start) * 1000.0
+        generate_cuda_ms = (
+            generate_start_event.elapsed_time(generate_end_event)
+            if generate_start_event is not None and generate_end_event is not None
+            else None
+        )
+        postprocess_start = time.perf_counter()
         action_np[:, -1] = 1.0 - action_np[:, -1]
 
         if self.cfg.action_space == "midtrain":
@@ -836,11 +870,17 @@ class RobolabPolicyService:
             video = self.model.decode(pred_vision_latent)  # [1,C,T,H,W]
             video = ((video[0].clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 3, 0)  # [T,H,W,3]
             outputs["video"] = video.detach().cpu().numpy()
+        postprocess_ms = (time.perf_counter() - postprocess_start) * 1000.0
         _write_profile_event(
             self._profile_jsonl,
             "request",
             seed=seed,
+            build_sample_ms=build_sample_ms,
+            build_batch_ms=build_batch_ms,
             generate_ms=generate_ms,
+            generate_cuda_ms=generate_cuda_ms,
+            action_transfer_ms=action_transfer_ms,
+            postprocess_ms=postprocess_ms,
             request_ms=(time.perf_counter() - request_start) * 1000.0,
             action_rows=int(action_np.shape[0]),
         )
