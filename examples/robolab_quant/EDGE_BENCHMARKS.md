@@ -10,6 +10,35 @@ RoboLab observation, action, calibration, replay, and paired-rollout protocol
 as the [Cosmos3 Nano benchmark](NANO_BENCHMARKS.md), while keeping model-family
 results separate.
 
+## v0.3 Release Profiles
+
+The public Edge release retains W8A16 as the calibration-free fallback and
+GenW8A8 as the recommended RTX 4090 profile. In GenW8A8, only the W4A16
+remainder uses DROID training calibration; the FP8 generation branch uses
+dynamic per-token activation scales.
+
+| Profile     | Preset                                | Peak reserved | Request p50 |       Banana SR |
+| ----------- | ------------------------------------- | ------------: | ----------: | --------------: |
+| W8A16       | `configs/edge_w8.yaml`                |        8.71GB |     576.0ms |     36/50 = 72% |
+| **GenW8A8** | `configs/edge_genw8a8_fast_4090.yaml` |        8.79GB | **331.4ms** | **40/50 = 80%** |
+
+### 128-Request Stability Gate
+
+Each profile replayed the same 32 real DROID training requests four times in
+one server process. The first lazy-initialization request is excluded. This is
+a shared-host longevity gate rather than a replacement for the idle-GPU
+headline latency above.
+
+| Profile | Requests | Request p50/p95 | Repeat p50, 0/1/2/3 | Last/peak reserved | Result |
+| ------- | -------: | --------------: | ------------------: | -----------------: | ------ |
+| W8A16   |      128 |       595/611ms |   594/595/594/598ms |        6.35/8.71GB | Pass   |
+| GenW8A8 |      128 |       408/420ms |   401/407/411/411ms |        5.70/8.79GB | Pass   |
+
+Neither run crashed, exhausted memory, returned non-finite actions, selected a
+fallback backend, or showed increasing CUDA reserved memory. These captures
+have no matched reference responses, so paired rollout remains the quality
+gate.
+
 ## Benchmark Summary
 
 ### Quantization Comparison

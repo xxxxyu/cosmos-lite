@@ -29,6 +29,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--limit", type=int, default=32)
     parser.add_argument("--skip", type=int, default=0)
+    parser.add_argument("--repeat", type=int, default=1)
     return parser
 
 
@@ -43,6 +44,8 @@ def main() -> None:
         request_files = request_files[: args.limit]
     if not request_files:
         raise FileNotFoundError(f"No captured RoboLab requests found in {capture_root}")
+    if args.repeat <= 0:
+        raise ValueError("--repeat must be positive")
 
     client = WebsocketClientPolicy(args.host, args.port)
     packer = msgpack_numpy.Packer()
@@ -51,49 +54,54 @@ def main() -> None:
     l1_values: list[float] = []
     linf_values: list[float] = []
     rows: list[dict[str, Any]] = []
-    for request_file in request_files:
-        request = msgpack_numpy.unpackb(request_file.read_bytes())
-        start = time.perf_counter()
-        response = client.infer(request)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        request_ms.append(elapsed_ms)
-        timing = response.get("server_timing", {})
-        if isinstance(timing, dict) and isinstance(timing.get("infer_ms"), (int, float)):
-            server_ms.append(float(timing["infer_ms"]))
-        action = np.asarray(response["action"], dtype=np.float32)
-        if not np.isfinite(action).all():
-            raise ValueError(f"Non-finite action returned for {request_file.name}")
-        reference_file = reference_root / request_file.name.replace(".request.", ".response.")
-        l1 = None
-        linf = None
-        if reference_file.is_file():
-            reference = msgpack_numpy.unpackb(reference_file.read_bytes())
-            reference_action = np.asarray(reference["action"], dtype=np.float32)
-            diff = np.abs(action - reference_action)
-            l1 = float(diff.mean())
-            linf = float(diff.max())
-            l1_values.append(l1)
-            linf_values.append(linf)
-        output_file = output_root / request_file.name.replace(".request.", ".response.")
-        output_file.write_bytes(packer.pack(response))
-        rows.append(
-            {
-                "sample": request_file.stem.split(".")[0],
-                "request_ms": elapsed_ms,
-                "server_ms": (
-                    float(timing["infer_ms"])
-                    if isinstance(timing, dict) and isinstance(timing.get("infer_ms"), (int, float))
-                    else None
-                ),
-                "l1_mean": l1,
-                "linf": linf,
-            }
-        )
+    for repeat_index in range(args.repeat):
+        for request_file in request_files:
+            request = msgpack_numpy.unpackb(request_file.read_bytes())
+            start = time.perf_counter()
+            response = client.infer(request)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            request_ms.append(elapsed_ms)
+            timing = response.get("server_timing", {})
+            if isinstance(timing, dict) and isinstance(timing.get("infer_ms"), (int, float)):
+                server_ms.append(float(timing["infer_ms"]))
+            action = np.asarray(response["action"], dtype=np.float32)
+            if not np.isfinite(action).all():
+                raise ValueError(f"Non-finite action returned for {request_file.name}")
+            reference_file = reference_root / request_file.name.replace(".request.", ".response.")
+            l1 = None
+            linf = None
+            if reference_file.is_file():
+                reference = msgpack_numpy.unpackb(reference_file.read_bytes())
+                reference_action = np.asarray(reference["action"], dtype=np.float32)
+                diff = np.abs(action - reference_action)
+                l1 = float(diff.mean())
+                linf = float(diff.max())
+                l1_values.append(l1)
+                linf_values.append(linf)
+            response_name = request_file.name.replace(".request.", ".response.")
+            if args.repeat > 1:
+                response_name = f"repeat_{repeat_index:03d}.{response_name}"
+            (output_root / response_name).write_bytes(packer.pack(response))
+            rows.append(
+                {
+                    "sample": request_file.stem.split(".")[0],
+                    "repeat": repeat_index,
+                    "request_ms": elapsed_ms,
+                    "server_ms": (
+                        float(timing["infer_ms"])
+                        if isinstance(timing, dict) and isinstance(timing.get("infer_ms"), (int, float))
+                        else None
+                    ),
+                    "l1_mean": l1,
+                    "linf": linf,
+                }
+            )
 
     metrics = {
         "capture_dir": str(capture_root),
         "reference_dir": str(reference_root) if reference_root != capture_root else None,
         "samples": len(rows),
+        "repeat": args.repeat,
         "request_ms": {"p50": _percentile(request_ms, 50), "p95": _percentile(request_ms, 95)},
         "server_ms": {"p50": _percentile(server_ms, 50), "p95": _percentile(server_ms, 95)},
         "action_error": {

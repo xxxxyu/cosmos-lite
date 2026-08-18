@@ -98,37 +98,74 @@ build_compile_args() {
   fi
 }
 
+deployment_server_field() {
+  local field="$1"
+  "$python_bin" -c \
+    'import sys; from cosmos_framework.scripts.robolab_deployment_config import load_deployment_config; print(getattr(load_deployment_config(sys.argv[1]).server, sys.argv[2]))' \
+    "$DEPLOYMENT_CONFIG" "$field"
+}
+
+build_deployment_args() {
+  deployment_args=(
+    --config "$DEPLOYMENT_CONFIG"
+    --bundle-dir "$BUNDLE_DIR"
+  )
+  if [[ -n "${RUN_DIR:-}" ]]; then
+    deployment_args+=(--output-dir "$RUN_DIR/server")
+  fi
+  if [[ -n "${HOST:-}" ]]; then
+    deployment_args+=(--host "$HOST")
+  fi
+  if [[ -n "${PORT:-}" ]]; then
+    deployment_args+=(--port "$PORT")
+  fi
+}
+
 start_server() {
   require_value BUNDLE_DIR
   local policy_gpu="${POLICY_GPU:-0}"
-  local host="${HOST:-127.0.0.1}"
-  local port="${PORT:-8000}"
-  local guidance="${GUIDANCE:-3.0}"
-  local num_steps="${NUM_STEPS:-2}"
-  build_compile_args
+  if [[ -n "${DEPLOYMENT_CONFIG:-}" ]]; then
+    SERVER_HOST="${HOST:-$(deployment_server_field host)}"
+    SERVER_PORT="${PORT:-$(deployment_server_field port)}"
+  else
+    SERVER_HOST="${HOST:-127.0.0.1}"
+    SERVER_PORT="${PORT:-8000}"
+  fi
   RUN_DIR="${RUN_DIR:-$PWD/robolab_quant_run_$(date +%Y%m%d_%H%M%S)}"
   export RUN_DIR
   mkdir -p "$RUN_DIR/server"
-  require_free_port "$host" "$port"
-  CUDA_VISIBLE_DEVICES="$policy_gpu" "$python_bin" -m \
-    cosmos_framework.scripts.action_policy_server_robolab \
-      --quant-import-dir "$BUNDLE_DIR" \
-      --host "$host" \
-      --port "$port" \
-      --output-dir "$RUN_DIR/server" \
-      --profile-jsonl "$RUN_DIR/profile.jsonl" \
-      --deterministic-seed \
-      --guidance "$guidance" \
-      --num-steps "$num_steps" \
-      "${compile_args[@]}" \
-      >"$RUN_DIR/server.log" 2>&1 &
+  require_free_port "$SERVER_HOST" "$SERVER_PORT"
+  if [[ -n "${DEPLOYMENT_CONFIG:-}" ]]; then
+    build_deployment_args
+    CUDA_VISIBLE_DEVICES="$policy_gpu" "$python_bin" -m \
+      cosmos_framework.scripts.action_policy_server_robolab_deploy \
+        "${deployment_args[@]}" \
+        >"$RUN_DIR/server.log" 2>&1 &
+  else
+    echo "warning: using legacy environment-variable server configuration; set DEPLOYMENT_CONFIG for a reproducible deployment" >&2
+    local guidance="${GUIDANCE:-3.0}"
+    local num_steps="${NUM_STEPS:-2}"
+    build_compile_args
+    CUDA_VISIBLE_DEVICES="$policy_gpu" "$python_bin" -m \
+      cosmos_framework.scripts.action_policy_server_robolab \
+        --quant-import-dir "$BUNDLE_DIR" \
+        --host "$SERVER_HOST" \
+        --port "$SERVER_PORT" \
+        --output-dir "$RUN_DIR/server" \
+        --profile-jsonl "$RUN_DIR/profile.jsonl" \
+        --deterministic-seed \
+        --guidance "$guidance" \
+        --num-steps "$num_steps" \
+        "${compile_args[@]}" \
+        >"$RUN_DIR/server.log" 2>&1 &
+  fi
   server_pid=$!
-  wait_for_port "$host" "$port" "$server_pid"
+  wait_for_port "$SERVER_HOST" "$SERVER_PORT" "$server_pid"
 }
 
 case "$command_name" in
   setup)
-    exec "$runtime_dir/setup.sh"
+    exec "$runtime_dir/setup.sh" "${@:2}"
     ;;
   build-public)
     require_runtime
@@ -165,19 +202,30 @@ case "$command_name" in
   serve)
     require_runtime
     require_value BUNDLE_DIR
-    require_free_port 127.0.0.1 "${PORT:-8000}"
-    build_compile_args
-    exec env CUDA_VISIBLE_DEVICES="${POLICY_GPU:-0}" "$python_bin" -m \
-      cosmos_framework.scripts.action_policy_server_robolab \
-        --quant-import-dir "$BUNDLE_DIR" \
-        --host "${HOST:-127.0.0.1}" \
-        --port "${PORT:-8000}" \
-        --output-dir "${RUN_DIR:-$PWD/robolab_quant_server}" \
-        --profile-jsonl "${RUN_DIR:-$PWD/robolab_quant_server}/profile.jsonl" \
-        --deterministic-seed \
-        --guidance "${GUIDANCE:-3.0}" \
-        --num-steps "${NUM_STEPS:-2}" \
-        "${compile_args[@]}"
+    if [[ -n "${DEPLOYMENT_CONFIG:-}" ]]; then
+      deployment_host="${HOST:-$(deployment_server_field host)}"
+      deployment_port="${PORT:-$(deployment_server_field port)}"
+      require_free_port "$deployment_host" "$deployment_port"
+      build_deployment_args
+      exec env CUDA_VISIBLE_DEVICES="${POLICY_GPU:-0}" "$python_bin" -m \
+        cosmos_framework.scripts.action_policy_server_robolab_deploy \
+          "${deployment_args[@]}"
+    else
+      echo "warning: using legacy environment-variable server configuration; set DEPLOYMENT_CONFIG for a reproducible deployment" >&2
+      require_free_port 127.0.0.1 "${PORT:-8000}"
+      build_compile_args
+      exec env CUDA_VISIBLE_DEVICES="${POLICY_GPU:-0}" "$python_bin" -m \
+        cosmos_framework.scripts.action_policy_server_robolab \
+          --quant-import-dir "$BUNDLE_DIR" \
+          --host "${HOST:-127.0.0.1}" \
+          --port "${PORT:-8000}" \
+          --output-dir "${RUN_DIR:-$PWD/robolab_quant_server}" \
+          --profile-jsonl "${RUN_DIR:-$PWD/robolab_quant_server}/profile.jsonl" \
+          --deterministic-seed \
+          --guidance "${GUIDANCE:-3.0}" \
+          --num-steps "${NUM_STEPS:-2}" \
+          "${compile_args[@]}"
+    fi
     ;;
   replay)
     require_runtime
@@ -186,9 +234,10 @@ case "$command_name" in
     replay_args=(
       --capture-dir "$CAPTURE_DIR"
       --output-dir "$RUN_DIR/replay"
-      --host "${HOST:-127.0.0.1}"
-      --port "${PORT:-8000}"
+      --host "$SERVER_HOST"
+      --port "$SERVER_PORT"
       --limit "${REPLAY_LIMIT:-32}"
+      --repeat "${REPLAY_REPEAT:-1}"
     )
     if [[ -n "${REFERENCE_DIR:-}" ]]; then
       replay_args+=(--reference-dir "$REFERENCE_DIR")
@@ -211,8 +260,8 @@ case "$command_name" in
       PYTHONPATH="$ROBOLAB_DIR${PYTHONPATH:+:$PYTHONPATH}" \
         CUDA_VISIBLE_DEVICES="${SIM_GPU:-1}" "$ROBOLAB_PYTHON" policies/cosmos3/run.py \
         --task "${TASK:-BananaInBowlTask}" \
-        --remote-host "${HOST:-127.0.0.1}" \
-        --remote-port "${PORT:-8000}" \
+        --remote-host "$SERVER_HOST" \
+        --remote-port "$SERVER_PORT" \
         --num-envs "${NUM_ENVS:-1}" \
         --num-runs "${NUM_RUNS:-1}" \
         --device cuda:0 \
@@ -237,12 +286,13 @@ Commands:
 Required environment variables by command:
   build-public: ASSET_DIR, BUNDLE_DIR; optional MODEL_FAMILY, STRATEGY, CALIBRATION_STATS, POLICY_GPU
   validate:     BUNDLE_DIR; optional STRATEGY
-  serve:        BUNDLE_DIR; optional POLICY_GPU, HOST, PORT, GUIDANCE, NUM_STEPS,
+  serve:        BUNDLE_DIR, DEPLOYMENT_CONFIG; optional POLICY_GPU, HOST, PORT, RUN_DIR
+  serve (dev):  BUNDLE_DIR; optional POLICY_GPU, HOST, PORT, GUIDANCE, NUM_STEPS,
                 TORCH_COMPILE, COMPILED_REGION, COMPILE_DYNAMIC, CUDA_GRAPHS,
                 FP8_PROJECTION_FUSION, FP8_GEMM_BACKEND, SAGE_ATTENTION, SAGE_PV, CONDITION_KV_CACHE,
                 SPARSE_VIDEO_TRANSFORM
-  replay:       BUNDLE_DIR, CAPTURE_DIR; optional REPLAY_LIMIT and server variables
-  rollout:      BUNDLE_DIR, ROBOLAB_DIR, ROBOLAB_PYTHON; optional SIM_GPU, TASK,
+  replay:       BUNDLE_DIR, DEPLOYMENT_CONFIG, CAPTURE_DIR; optional REPLAY_LIMIT, REPLAY_REPEAT and server variables
+  rollout:      BUNDLE_DIR, DEPLOYMENT_CONFIG, ROBOLAB_DIR, ROBOLAB_PYTHON; optional SIM_GPU, TASK,
                 NUM_ENVS, NUM_RUNS, VIDEO_MODE and server variables
 EOF
     ;;

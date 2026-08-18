@@ -14,10 +14,57 @@ from cosmos_framework.scripts.robolab_quant_pipeline import (
     _DROID_REVISION,
     _EDGE_DROID_REPOSITORY,
     _EDGE_DROID_REVISION,
+    _load_source_provenance,
+    _parser,
     _prepare_public_sources,
 )
 
 pytestmark = [pytest.mark.L0, pytest.mark.CPU]
+
+
+def test_public_builder_exposes_only_release_strategies() -> None:
+    for strategy in ("full_w8", "gen_branch_w8a8"):
+        args = _parser().parse_args(
+            [
+                "build-public",
+                "--asset-dir",
+                "/tmp/assets",
+                "--output-dir",
+                "/tmp/output",
+                "--strategy",
+                strategy,
+            ]
+        )
+        assert args.strategy == strategy
+
+    with pytest.raises(SystemExit):
+        _parser().parse_args(
+            [
+                "build-public",
+                "--asset-dir",
+                "/tmp/assets",
+                "--output-dir",
+                "/tmp/output",
+                "--strategy",
+                "full_w4",
+            ]
+        )
+
+
+def test_load_source_provenance_requires_release_mappings(tmp_path: Path) -> None:
+    path = tmp_path / "provenance.json"
+    value = {
+        "repositories": {"droid": "nvidia/policy", "wan": "Wan-AI/vae"},
+        "requested_revisions": {"droid": "main", "wan": "main"},
+        "resolved_revisions": {"droid": "droid-sha", "wan": "wan-sha"},
+    }
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    assert _load_source_provenance(path) == value
+
+    path.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON object"):
+        _load_source_provenance(path)
 
 
 def test_prepare_public_sources_records_resolved_revisions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

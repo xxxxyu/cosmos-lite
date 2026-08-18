@@ -25,11 +25,13 @@ from cosmos_framework.inference.common.init import init_script
 
 init_script()
 
+import asyncio
 import json
 import os
 import socket
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -322,6 +324,53 @@ def _load_openpi_websocket_policy_server() -> type[Any]:
                 "or install the full Physical-Intelligence/openpi package."
             ) from exc
     return WebsocketPolicyServer
+
+
+def _responsive_openpi_websocket_policy_server(base_cls: type[Any]) -> type[Any]:
+    """Keep WebSocket control traffic responsive during long first-request compilation."""
+
+    import websockets
+    import websockets.frames
+    from openpi_client import msgpack_numpy
+
+    class ResponsiveWebsocketPolicyServer(base_cls):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._inference_lock = asyncio.Lock()
+            self._first_inference_complete = False
+
+        async def _handler(self, websocket: Any) -> None:
+            packer = msgpack_numpy.Packer()
+            await websocket.send(packer.pack(self._metadata))
+            prev_total_time = None
+            while True:
+                try:
+                    start_time = time.monotonic()
+                    obs = msgpack_numpy.unpackb(await websocket.recv())
+                    infer_start = time.monotonic()
+                    async with self._inference_lock:
+                        if self._first_inference_complete:
+                            action = self._policy.infer(obs)
+                        else:
+                            action = await asyncio.to_thread(self._policy.infer, obs)
+                            self._first_inference_complete = True
+                    infer_time = time.monotonic() - infer_start
+                    action["server_timing"] = {"infer_ms": infer_time * 1000}
+                    if prev_total_time is not None:
+                        action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
+                    await websocket.send(packer.pack(action))
+                    prev_total_time = time.monotonic() - start_time
+                except websockets.ConnectionClosed:
+                    break
+                except Exception:
+                    await websocket.send(traceback.format_exc())
+                    await websocket.close(
+                        code=websockets.frames.CloseCode.INTERNAL_ERROR,
+                        reason="Internal server error. Traceback included in previous frame.",
+                    )
+                    raise
+
+    return ResponsiveWebsocketPolicyServer
 
 
 class _DummyDataset(torch.utils.data.IterableDataset):
@@ -897,7 +946,7 @@ def serve(args: RobolabServerArgs) -> None:
     local_ip = get_local_ip()
     log.info(f"[robolab-policy-server] Server accessible at: ws://{local_ip}:{int(args.port)}/")
     log.info(f"[robolab-policy-server] Health check: http://{local_ip}:{int(args.port)}/healthz")
-    server_cls = _load_openpi_websocket_policy_server()
+    server_cls = _responsive_openpi_websocket_policy_server(_load_openpi_websocket_policy_server())
     server_cls(policy=service, host=args.host, port=int(args.port), metadata={}).serve_forever()
 
 

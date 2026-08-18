@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -73,6 +76,79 @@ def test_load_openpi_websocket_policy_server_from_lightweight_package(monkeypatc
     monkeypatch.setitem(sys.modules, "openpi_server.websocket_policy_server", fake_module)
 
     assert robolab_server._load_openpi_websocket_policy_server() is FakeWebsocketPolicyServer
+
+
+def test_responsive_websocket_server_offloads_only_first_inference() -> None:
+    from openpi_client import msgpack_numpy
+
+    first_inference_started = threading.Event()
+    release_first_inference = threading.Event()
+
+    class FakePolicy:
+        def __init__(self) -> None:
+            self.thread_ids: list[int] = []
+
+        def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
+            self.thread_ids.append(threading.get_ident())
+            if len(self.thread_ids) == 1:
+                first_inference_started.set()
+                assert release_first_inference.wait(timeout=1.0)
+            return {"actions": np.asarray([[obs["request"]]], dtype=np.float32)}
+
+    class FakeBaseServer:
+        def __init__(self, policy: Any, metadata: dict[str, Any]) -> None:
+            self._policy = policy
+            self._metadata = metadata
+
+    class FakeWebsocket:
+        def __init__(self) -> None:
+            packer = msgpack_numpy.Packer()
+            self._requests = [packer.pack({"request": 1}), packer.pack({"request": 2})]
+            self.sent: list[bytes] = []
+            self.responses_complete = asyncio.Event()
+            self.wait_forever = asyncio.Event()
+
+        async def recv(self) -> bytes:
+            if self._requests:
+                return self._requests.pop(0)
+            await self.wait_forever.wait()
+            raise AssertionError("unreachable")
+
+        async def send(self, payload: bytes) -> None:
+            self.sent.append(payload)
+            if len(self.sent) == 3:
+                self.responses_complete.set()
+
+    async def exercise_server() -> None:
+        policy = FakePolicy()
+        server_cls = robolab_server._responsive_openpi_websocket_policy_server(FakeBaseServer)
+        server = server_cls(policy=policy, metadata={"model": "test"})
+        websocket = FakeWebsocket()
+        event_loop_thread = threading.get_ident()
+        handler = asyncio.create_task(server._handler(websocket))
+
+        try:
+            assert await asyncio.to_thread(first_inference_started.wait, 0.5)
+            await asyncio.sleep(0)
+            assert len(websocket.sent) == 1
+            release_first_inference.set()
+            await asyncio.wait_for(websocket.responses_complete.wait(), timeout=1.0)
+
+            assert policy.thread_ids[0] != event_loop_thread
+            assert policy.thread_ids[1] == event_loop_thread
+            first_response = msgpack_numpy.unpackb(websocket.sent[1])
+            second_response = msgpack_numpy.unpackb(websocket.sent[2])
+            assert first_response["actions"].item() == 1
+            assert second_response["actions"].item() == 2
+            assert first_response["server_timing"]["infer_ms"] >= 0
+            assert second_response["server_timing"]["prev_total_ms"] >= 0
+        finally:
+            release_first_inference.set()
+            handler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handler
+
+    asyncio.run(exercise_server())
 
 
 def test_server_args_default_to_released_droid_serving_config() -> None:

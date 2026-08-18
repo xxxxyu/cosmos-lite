@@ -400,8 +400,15 @@ class VllmCutlassFp8ProjectionGroup(nn.Module):
         size_k = projections[0].size_k
         if any(projection.size_k != size_k for projection in projections):
             raise ValueError("Grouped FP8 projections must have the same input width")
-        if any(projection.input_scale is not None for projection in projections):
-            raise ValueError("Grouped FP8 projections require identical unscaled activation inputs")
+        input_scales = [projection.input_scale for projection in projections]
+        if any(scale is None for scale in input_scales) and not all(scale is None for scale in input_scales):
+            raise ValueError("Grouped FP8 projections must either all use or all omit input scaling")
+        if input_scales[0] is not None:
+            if any(not torch.equal(input_scales[0], scale) for scale in input_scales[1:]):
+                raise ValueError("Grouped FP8 projections must use identical input scales")
+            self.register_buffer("input_scale", input_scales[0], persistent=False)
+        else:
+            self.input_scale = None
         self.size_k = size_k
         self.out_features = tuple(projection.size_n for projection in projections)
         self.projections = nn.ModuleList(projections)
@@ -414,6 +421,8 @@ class VllmCutlassFp8ProjectionGroup(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        if self.input_scale is not None:
+            x_2d = (x_2d / self.input_scale).contiguous()
         q_x, scale_a = self._ops().scaled_fp8_quant(x_2d, use_per_token_if_dynamic=True)
         outputs = tuple(projection.forward_quantized(q_x, scale_a) for projection in self.projections)
         prefix = x.shape[:-1]

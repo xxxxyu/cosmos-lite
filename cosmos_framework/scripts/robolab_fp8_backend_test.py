@@ -96,3 +96,49 @@ def test_fp8_projection_group_matches_independent_linears() -> None:
 
     for grouped, independent in zip(actual, expected, strict=True):
         torch.testing.assert_close(grouped, independent, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fp8_projection_group_matches_linears_with_shared_input_scale() -> None:
+    device = torch.device("cuda:0")
+    capability = torch.cuda.get_device_capability(device)
+    if capability[0] * 10 + capability[1] < 89:
+        pytest.skip("Native FP8 requires SM89 or newer")
+
+    generator = torch.Generator(device=device).manual_seed(13)
+    x = torch.randn(5, 17, 128, dtype=torch.bfloat16, device=device, generator=generator)
+    input_scale = torch.linspace(0.5, 1.5, 128, dtype=torch.bfloat16, device=device)
+    projections = [
+        backends.VllmCutlassFp8W8A8Linear(
+            torch.randn(size_n, 128, dtype=torch.bfloat16, device=device, generator=generator),
+            input_scale=input_scale,
+        )
+        for size_n in (256, 128, 128)
+    ]
+    expected = tuple(projection(x) for projection in projections)
+    group = backends.VllmCutlassFp8ProjectionGroup(projections)
+
+    actual = group(x)
+
+    for grouped, independent in zip(actual, expected, strict=True):
+        torch.testing.assert_close(grouped, independent, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fp8_projection_group_rejects_different_input_scales() -> None:
+    device = torch.device("cuda:0")
+    capability = torch.cuda.get_device_capability(device)
+    if capability[0] * 10 + capability[1] < 89:
+        pytest.skip("Native FP8 requires SM89 or newer")
+
+    generator = torch.Generator(device=device).manual_seed(17)
+    projections = [
+        backends.VllmCutlassFp8W8A8Linear(
+            torch.randn(128, 128, dtype=torch.bfloat16, device=device, generator=generator),
+            input_scale=torch.full((128,), value, dtype=torch.bfloat16, device=device),
+        )
+        for value in (0.5, 0.75)
+    ]
+
+    with pytest.raises(ValueError, match="identical input scales"):
+        backends.VllmCutlassFp8ProjectionGroup(projections)

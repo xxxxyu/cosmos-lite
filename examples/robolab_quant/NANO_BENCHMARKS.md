@@ -9,6 +9,38 @@ This is the deployment-oriented benchmark record for Cosmos3 Nano Policy DROID
 on RTX 4090. It separates open-loop diagnostics from closed-loop task success.
 For commands and artifact requirements, see [README.md](README.md).
 
+## v0.3 Release Profiles
+
+The public Nano release retains only two non-redundant deployment profiles.
+W8A16 is the calibration-free fallback. GenW8A8 is the recommended RTX 4090
+profile: its W4A16 remainder uses 128 DROID training captures for input
+equalization, while its FP8 generation branch uses dynamic per-token activation
+scales. The headline latency and success-rate results use the paired Banana
+protocol described below.
+
+| Profile     | Preset                                | Peak reserved | Request p50 |       Banana SR |
+| ----------- | ------------------------------------- | ------------: | ----------: | --------------: |
+| W8A16       | `configs/nano_w8.yaml`                |       21.42GB |     2,403ms |     45/50 = 90% |
+| **GenW8A8** | `configs/nano_genw8a8_fast_4090.yaml` |   **15.51GB** | **958.5ms** | **49/50 = 98%** |
+
+### 128-Request Stability Gate
+
+Before release, each profile replayed the same 32 real DROID training requests
+four times in one server process. The table excludes the first request, which
+includes lazy initialization and compilation. This longer run verifies finite
+32x8 actions, stable memory, and backend reliability; its latency was measured
+on a shared local host and does not replace the idle-GPU headline above.
+
+| Profile | Requests | Request p50/p95 |       Repeat p50, 0/1/2/3 | Last/peak reserved | Result |
+| ------- | -------: | --------------: | ------------------------: | -----------------: | ------ |
+| W8A16   |      128 |   1,746/1,758ms | 1,728/1,747/1,744/1,752ms |      19.07/19.07GB | Pass   |
+| GenW8A8 |      128 |   1,010/1,015ms |   990/1,008/1,011/1,012ms |      15.51/15.51GB | Pass   |
+
+Neither run crashed, exhausted memory, returned non-finite actions, selected a
+fallback backend, or showed increasing CUDA reserved memory. Replay captures
+do not include matched reference responses, so this gate intentionally does
+not report action-error metrics; paired rollout remains the quality gate.
+
 ## Benchmark Summary
 
 ### Quantization Comparison

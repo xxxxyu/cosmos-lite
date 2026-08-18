@@ -5,259 +5,227 @@ SPDX-License-Identifier: OpenMDW-1.1
 
 # Cosmos3 RoboLab Quantized Pipeline
 
-This is the release entry point for downloading or building a self-contained
-packed W4A16/W8A16 Cosmos3 Nano or Edge Policy DROID bundle and running it
-against RoboLab on RTX 4090. See [NANO_BENCHMARKS.md](NANO_BENCHMARKS.md) for
-Nano and [EDGE_BENCHMARKS.md](EDGE_BENCHMARKS.md) for Edge before changing a strategy
-or sampler.
+This is the release entry point for serving Cosmos3 Nano and Edge DROID
+policies on one 24GB RTX 4090 and evaluating them in RoboLab. The public path
+has two checkpoint types per model family:
 
-The Ada FP8 W8A8 path is tracked in the
-[FP8 experiment](FP8_W8A8_EXPERIMENT.md). Its optional training-free compile
-path and rejected CUDA Graph variants are documented in the
-[graph optimization experiment](GRAPH_OPTIMIZATION_EXPERIMENT.md). Stable
-recommendations below remain W4A16/W8A16 pending release review and bundle
-distribution.
+For multi-GPU evaluation, start with the
+[8-GPU rollout throughput guide](ROLLOUT_THROUGHPUT.md). It covers vectorized
+RoboLab environments, policy/simulator GPU layouts, request staggering, and
+scene-aware task sharding.
 
-RTX 4090 shape-aware attention, FP8 kernel profiling, and condition-cache
-results are documented in the [SM89 optimization report](SM89_OPTIMIZATION.md).
+| Checkpoint | Purpose                         | Calibration                 | RTX 4090 backend                                   |
+| ---------- | ------------------------------- | --------------------------- | -------------------------------------------------- |
+| W8A16      | Portable quality-first fallback | None                        | Marlin + FlashAttention 2                          |
+| GenW8A8    | Recommended low-latency profile | 128 DROID training requests | FP8 generation branch + calibrated W4A16 remainder |
 
-For experimental GenW8A8 deployment on RTX 4090, use the validated profile for
-the corresponding model family. Nano uses shape-aware SageAttention and the
-request-local condition cache while retaining vLLM CUTLASS FP8 GEMM:
+GenW8A8 uses FP8 W8A8 only in the generation branch. It is not full-model
+FP8. Other W4, W8A16 mixed, and full-W8A8 strategies remain available for
+research reproduction, but they are not release checkpoints or recommended
+deployment profiles.
 
-```bash
-TORCH_COMPILE=1 \
-COMPILED_REGION=language \
-COMPILE_DYNAMIC=1 \
-FP8_PROJECTION_FUSION=shared \
-SAGE_ATTENTION=1 \
-CONDITION_KV_CACHE=1 \
-BUNDLE_DIR=/path/to/gen_w8a8_bundle \
-examples/robolab_quant/pipeline.sh serve
-```
+## Validated Results
 
-Edge uses the higher-fidelity Sage FP16-PV mode with the shape-tuned SM89 FP8
-GEMM:
+All rows use RoboLab `BananaInBowlTask`, guidance 3, two UniPC denoise steps,
+32 generated and executed actions, and 50 paired rollouts. Latency is p50
+end-to-end policy request latency; VRAM is peak CUDA reserved memory on RTX
+4090.
 
-```bash
-TORCH_COMPILE=1 \
-COMPILED_REGION=language \
-COMPILE_DYNAMIC=1 \
-FP8_PROJECTION_FUSION=shared \
-FP8_GEMM_BACKEND=triton_sm89 \
-SAGE_ATTENTION=1 \
-SAGE_PV=fp16_fp32 \
-BUNDLE_DIR=/path/to/edge_gen_w8a8_bundle \
-examples/robolab_quant/pipeline.sh serve
-```
+| Model    | Checkpoint  | VRAM (GB) | Latency (ms) | Success Rate (%) |
+| -------- | ----------- | --------: | -----------: | ---------------: |
+| Edge 4B  | W8A16       |      8.71 |        576.0 |               72 |
+| Edge 4B  | **GenW8A8** |      8.79 |    **331.4** |           **80** |
+| Nano 16B | W8A16       |     21.42 |      2,403.0 |               90 |
+| Nano 16B | **GenW8A8** | **15.51** |    **958.5** |           **98** |
 
-Issue one warmup request before control starts. Projection sharing requires an
-FP8 bundle and is rejected when shape recording or online calibration-stat
-collection is enabled. Install the optional SM89 backend first with
-`examples/quantized_robot_policy/install_sage_attention.sh`.
+The success-rate point estimates do not establish that GenW8A8 improves
+policy quality. They show that the promoted fast profiles passed the existing
+paired Banana gate. See [Nano benchmarks](NANO_BENCHMARKS.md),
+[Edge benchmarks](EDGE_BENCHMARKS.md), and the
+[SM89 optimization report](SM89_OPTIMIZATION.md) for protocols and ablations.
 
-The server resizes only the observed frame and directly allocates zero future
-frames at target resolution. This bit-equivalent CPU data-path optimization is
-enabled by default; set `SPARSE_VIDEO_TRANSFORM=0` to restore the legacy
-full-video transform for diagnosis or a custom integration.
+## 1. Install The Policy Runtime
 
-The SM89 Triton backend recognizes only the validated Edge Gen shapes and
-falls back to CUTLASS for all other shapes. It improved Edge request p50 by
-8.4% and passed the paired 50-rollout quality gate. Nano Triton improved
-request p50 by 8.7%, but its success-rate point estimate fell from 98% to 94%;
-those Nano shapes are intentionally excluded from the production backend.
-Edge Sage FP8-PV remains experimental because its estimate was 68% versus the
-74% FlashAttention2 baseline. The promoted higher-fidelity FP16-PV
-mode reached 80% versus 78% for the matched Triton+FlashAttention2 baseline
-and reduced request p50 from 349.7 ms to 331.4 ms. See the SM89 report for the
-full evidence.
-
-## 1. Setup
+W8A16 uses the minimal locked runtime:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 examples/robolab_quant/pipeline.sh setup
 ```
 
-The shared locked environment contains only the policy runtime. RoboLab and
-IsaacSim remain in their own environment or container.
+The RTX 4090 GenW8A8 presets require the optional pinned SageAttention SM89
+extension. Its source build requires a CUDA 12.4-or-newer toolkit with `nvcc`
+and a C++ build toolchain:
 
-## 2. Download A Prebuilt Bundle
+```bash
+CUDA_VISIBLE_DEVICES=0 examples/robolab_quant/pipeline.sh setup --with-sage
+```
 
-The prebuilt Hugging Face bundles are the shortest deployment path.
+RoboLab and IsaacSim stay in their own environment or container. The policy
+runtime does not install simulator or training dependencies.
 
-### Cosmos3 Nano
+## 2. Download A Self-Contained Bundle
 
-| Model                                                                                         | Strategy        | Validated role              |
-| --------------------------------------------------------------------------------------------- | --------------- | --------------------------- |
-| [`W8A16`](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W8A16)               | `full_w8`       | General default             |
-| [`W4A16`](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W4A16)               | `full_w4`       | Experimental minimum memory |
-| [`W4A16-AttnW8`](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W4A16-AttnW8) | `attention_w8`  | Banana low-memory option    |
-| [`W4A16-GenW8`](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W4A16-GenW8)   | `gen_branch_w8` | Banana-specific option      |
+| Family | W8A16                                                                                                                   | GenW8A8                                    |
+| ------ | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| Nano   | [`XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W8A16`](https://huggingface.co/XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W8A16) | `XXXXyu/Cosmos3-Nano-Policy-DROID-GenW8A8` |
+| Edge   | [`XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W8A16`](https://huggingface.co/XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W8A16) | `XXXXyu/Cosmos3-Edge-Policy-DROID-GenW8A8` |
 
 ```bash
 python -m pip install -U "huggingface_hub[cli]"
 hf download "XXXXyu/Cosmos3-Nano-Policy-DROID-Marlin-W8A16" \
-  --local-dir /data/cosmos3_quant/robolab_full_w8
+  --local-dir /data/cosmos_lite/nano_w8
 ```
 
-Continue with validation below. The bundle is self-contained; the NVIDIA BF16
-checkpoint and DROID calibration data are not deployment dependencies.
+Each bundle includes packed and residual weights, runtime config, tokenizer or
+processor, VAE, provenance, file sizes, and SHA256 hashes. The source BF16
+checkpoint and calibration data are not deployment dependencies.
 
-### Cosmos3 Edge
+## 3. Select A Deployment Config
 
-| Model                                                                                         | Strategy        | Validated role                    |
-| --------------------------------------------------------------------------------------------- | --------------- | --------------------------------- |
-| [`W8A16`](https://huggingface.co/XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W8A16)               | `full_w8`       | General default; calibration-free |
-| [`W4A16`](https://huggingface.co/XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W4A16)               | `full_w4`       | Minimum steady model allocation   |
-| [`W4A16-AttnW8`](https://huggingface.co/XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W4A16-AttnW8) | `attention_w8`  | Verified on Banana                |
-| [`W4A16-GenW8`](https://huggingface.co/XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W4A16-GenW8)   | `gen_branch_w8` | Highest observed Banana SR        |
+Formal serving uses YAML. Environment-variable tuning remains available only
+through the legacy development entry point.
+
+| Preset                                                               | Use                               |
+| -------------------------------------------------------------------- | --------------------------------- |
+| [`nano_w8.yaml`](configs/nano_w8.yaml)                               | Nano W8A16 portable fallback      |
+| [`nano_genw8a8_fast_4090.yaml`](configs/nano_genw8a8_fast_4090.yaml) | Nano recommended RTX 4090 profile |
+| [`edge_w8.yaml`](configs/edge_w8.yaml)                               | Edge W8A16 portable fallback      |
+| [`edge_genw8a8_fast_4090.yaml`](configs/edge_genw8a8_fast_4090.yaml) | Edge recommended RTX 4090 profile |
+
+Release presets use strict backend checks. A missing Sage build, incompatible
+GPU, wrong bundle family/strategy, or unavailable tuned Triton backend fails
+before model loading. There is no silent benchmark fallback. Custom development
+configs may set `runtime.backend_policy: best_available`; every fallback is
+then written to the resolved deployment record.
+
+Run the deployment doctor before loading the model:
 
 ```bash
-hf download "XXXXyu/Cosmos3-Edge-Policy-DROID-Marlin-W8A16" \
-  --local-dir /data/cosmos3_quant/edge_full_w8
+examples/quantized_robot_policy/.venv/bin/python \
+  examples/quantized_robot_policy/check_runtime.py \
+  --require-cuda \
+  --repo-root "$PWD" \
+  --deployment-config examples/robolab_quant/configs/nano_w8.yaml \
+  --bundle-dir /data/cosmos_lite/nano_w8
 ```
 
-Use guidance 3 and two denoise steps for the validated accelerated sampler.
-See [EDGE_BENCHMARKS.md](EDGE_BENCHMARKS.md) for the complete paired matrix and
-scope of each recommendation.
+## 4. Validate And Serve
 
-### Build From The Public Policy
-
-The default command downloads an immutable DROID policy revision, only the
-Qwen tokenizer files needed at runtime, and the Wan VAE. It then stream-packs
-`full_w8` without loading the complete BF16 policy on GPU.
+Strong bundle validation is CPU-only:
 
 ```bash
-HF_TOKEN=... \
-ASSET_DIR=/data/cosmos3_quant/sources \
-BUNDLE_DIR=/data/cosmos3_quant/robolab_full_w8 \
+BUNDLE_DIR=/data/cosmos_lite/nano_w8 \
 STRATEGY=full_w8 \
-POLICY_GPU=0 \
-examples/robolab_quant/pipeline.sh build-public
-```
-
-The defaults pin DROID to `6706d7680581c255ff61e0f3bb49d90eac55c79e`,
-Qwen to `0c351dd01ed87e9c1b53cbc748cba10e6187ff3b`, and Wan to
-`921dbaf3f1674a56f47e83fb80a34bac8a8f203e`. `sources.json` records requested
-and resolved revisions, which are also embedded in the bundle manifest.
-Reusing `ASSET_DIR` resumes downloads. The output directory must not exist.
-
-W4 or mixed strategies additionally require DROID training calibration stats:
-
-```bash
-STRATEGY=attention_w8 \
-CALIBRATION_STATS=/path/to/droid_train128_input_amax.pt \
-ASSET_DIR=/data/cosmos3_quant/sources \
-BUNDLE_DIR=/data/cosmos3_quant/robolab_attention_w8 \
-POLICY_GPU=0 \
-examples/robolab_quant/pipeline.sh build-public
-```
-
-## 3. Validate Or Transfer
-
-```bash
-BUNDLE_DIR=/path/to/robolab_full_w8 STRATEGY=full_w8 \
 examples/robolab_quant/pipeline.sh validate
 ```
 
-This CPU-only command verifies all hashes, opens every packed payload, and
-checks the strategy precision map. Nano bundles contain 504 payloads and Edge
-bundles contain 336; the count is read from the manifest. Serving a completed
-bundle never reads the
-source checkpoint or calibration dataset.
-
-## 4. Replay
+Start the server from a release preset:
 
 ```bash
-BUNDLE_DIR=/path/to/robolab_full_w8 \
-CAPTURE_DIR=/path/to/openpi_replay_requests \
-RUN_DIR=/data/cosmos3_runs/robolab_replay \
+BUNDLE_DIR=/data/cosmos_lite/nano_w8 \
+DEPLOYMENT_CONFIG=examples/robolab_quant/configs/nano_w8.yaml \
+RUN_DIR=/data/cosmos_lite/runs/nano_w8 \
+POLICY_GPU=0 \
+examples/robolab_quant/pipeline.sh serve
+```
+
+Every config-driven launch writes
+`RUN_DIR/server/resolved_deployment_config.json`. It records requested and
+effective settings, bundle manifest hash, model family, strategy, git revision,
+GPU capability, dependency probe, and fallback decisions. Request timing and
+memory events are written to `profile.jsonl` in the same directory.
+
+The WebSocket endpoint defaults to `127.0.0.1:8000` and has no built-in TLS or
+authentication. Keep it on loopback or place it behind a trusted authenticated
+transport.
+
+## 5. Request Replay
+
+Request replay sends fixed recorded policy observations without simulator
+feedback. It measures action error, latency, memory, and runtime stability; it
+does not measure task success.
+
+```bash
+BUNDLE_DIR=/data/cosmos_lite/nano_w8 \
+DEPLOYMENT_CONFIG=examples/robolab_quant/configs/nano_w8.yaml \
+CAPTURE_DIR=/data/cosmos_lite/request_replay \
+RUN_DIR=/data/cosmos_lite/runs/nano_w8_replay \
 POLICY_GPU=0 \
 examples/robolab_quant/pipeline.sh replay
 ```
 
-The general deployment default is guidance 3.0 / two UniPC steps. Set
-`GUIDANCE=3.0 NUM_STEPS=4` for the conservative rollback sampler.
+## 6. Closed-Loop Rollout
 
-## 5. Rollout
-
-Use separate physical GPUs for the policy server and IsaacSim. Merely passing
-`--device` is insufficient because Vulkan may initialize on physical GPU 0.
+A rollout executes actions in RoboLab, so each new observation depends on the
+previous action. It measures closed-loop task success. Use separate physical
+GPUs for the policy server and IsaacSim because Vulkan device selection is not
+fully controlled by the policy `--device` flag.
 
 ```bash
-BUNDLE_DIR=/path/to/robolab_full_w8 \
+BUNDLE_DIR=/data/cosmos_lite/nano_w8 \
+DEPLOYMENT_CONFIG=examples/robolab_quant/configs/nano_w8.yaml \
 ROBOLAB_DIR=/path/to/RoboLab \
 ROBOLAB_PYTHON=/path/to/robolab/python \
-RUN_DIR=/data/cosmos3_runs/robolab_banana \
+RUN_DIR=/data/cosmos_lite/runs/nano_w8_banana \
 POLICY_GPU=0 SIM_GPU=1 \
 TASK=BananaInBowlTask NUM_ENVS=1 NUM_RUNS=1 \
 examples/robolab_quant/pipeline.sh rollout
 ```
 
-`ROBOLAB_PYTHON` may be the interpreter inside the official RoboLab container
-or a validated host installation. The policy server uses the locked Cosmos
-runtime, never the simulator interpreter.
+The client builds one 640x540 RGB input from three RoboLab views: a 640x360
+wrist view above two 320x180 exterior views. The server maps it to the policy's
+736x544 bucket and returns a 32x8 action chunk. The standard RoboLab Cosmos3
+client executes all 32 actions before requesting the next chunk.
 
-## Observation Contract
+## 7. Build From NVIDIA's Public DROID Policy
 
-RoboLab renders three 1280x720 views. The client constructs one 640x540 RGB
-image with a 640x360 wrist view above two 320x180 exterior views. The server
-maps this to the model's 736x544 bucket. Requests also contain joint position,
-gripper state, and task text; responses contain a 32x8 action chunk.
-
-## Strategy Selection
-
-| Nano strategy   | W4/W8 modules | Peak reserved | Deployment role                             |
-| --------------- | ------------: | ------------: | ------------------------------------------- |
-| `full_w8`       |         0/504 |       21.42GB | General default                             |
-| `attention_w8`  |       216/288 |       16.21GB | Banana-only low-memory option at g3/s4      |
-| `gen_branch_w8` |       252/252 |       18.03GB | Banana-specific; failed cross-task transfer |
-| `full_w4`       |         504/0 |       14.67GB | Experimental; failed quality gate           |
-
-Use `full_w8`, guidance 3.0, two steps for general RoboLab deployment. It
-reached 45/50 on Banana and 25/30 across three additional task sets. Do not
-promote a mixed strategy to another task without paired rollout validation.
-
-Build Edge directly from NVIDIA's public 4B DROID policy with the same entry
-point:
+W8A16 is calibration-free and stream-packed without placing the full BF16
+policy on GPU:
 
 ```bash
 HF_TOKEN=... \
-MODEL_FAMILY=cosmos3_edge \
-ASSET_DIR=/data/cosmos3_quant/edge_sources \
-BUNDLE_DIR=/data/cosmos3_quant/edge_full_w8 \
+MODEL_FAMILY=cosmos3_nano \
 STRATEGY=full_w8 \
+ASSET_DIR=/data/cosmos_lite/sources/nano \
+BUNDLE_DIR=/data/cosmos_lite/nano_w8 \
 POLICY_GPU=0 \
 examples/robolab_quant/pipeline.sh build-public
 ```
 
-The Edge source contains its own processor and vision tower. The pipeline
-copies both into the bundle, validates the local vision weights, and uses the
-same model-agnostic RoboLab OpenPI client as Nano.
+For Edge, set `MODEL_FAMILY=cosmos3_edge`. Source revisions are pinned and
+recorded in `sources.json` and the bundle manifest. Reusing `ASSET_DIR` resumes
+downloads; a completed `BUNDLE_DIR` is never overwritten.
 
-## DROID Training Calibration
-
-W4/mixed bundles use 128 frames from 128 distinct episodes of
-`nvidia/Cosmos3-DROID`, revision
-`5c11a20accb11497270a5247a7f1e66ad04c956c`, split `train/success`.
-Calibration is embodiment/input-contract specific, not Banana-task specific.
-
-To reproduce it, export requests with
-`export_robolab_train_calibration_requests`, replay all 128 requests through a
-`full_w8` server using `--calibration-stats-output`, then pass the resulting
-stats to `build-public`. See the benchmark's Training Calibration Protocol for
-the exact sample and view contract.
-
-## Serving Only
+GenW8A8 requires input-channel statistics from 128 distinct episodes in the
+official `nvidia/Cosmos3-DROID` `train/success` split. No RoboLab Banana
+evaluation episode is used. Build it with:
 
 ```bash
-BUNDLE_DIR=/path/to/robolab_full_w8 POLICY_GPU=0 \
-examples/robolab_quant/pipeline.sh serve
+HF_TOKEN=... \
+MODEL_FAMILY=cosmos3_nano \
+STRATEGY=gen_branch_w8a8 \
+CALIBRATION_STATS=/path/to/droid_train128_input_amax.pt \
+ASSET_DIR=/data/cosmos_lite/sources/nano \
+BUNDLE_DIR=/data/cosmos_lite/nano_genw8a8 \
+POLICY_GPU=0 \
+examples/robolab_quant/pipeline.sh build-public
 ```
 
-The OpenPI WebSocket endpoint defaults to `127.0.0.1:8000`. Roll back by using
-the same immutable `full_w8` bundle with guidance 3.0 / four steps.
+The calibration export and replay protocol is documented in the Training
+Calibration section of the family benchmark reports.
 
-The server has no built-in TLS or authentication. Keep the loopback default,
-or expose it only through a trusted network, SSH tunnel, or authenticated
-encrypted proxy.
+## Development And Reproduction
+
+The implementation still supports full W4, AttentionW8, generation-branch
+W8A16, full W8A8, equalization experiments, and direct CLI/environment tuning.
+These paths are intentionally absent from the release quickstart because they
+did not add a distinct deployment benefit over W8A16 or GenW8A8.
+
+Use the following records to reproduce or extend them:
+
+- [Nano benchmark matrix](NANO_BENCHMARKS.md)
+- [Edge benchmark matrix](EDGE_BENCHMARKS.md)
+- [FP8 W8A8 experiment](FP8_W8A8_EXPERIMENT.md)
+- [Compile and CUDA Graph experiment](GRAPH_OPTIMIZATION_EXPERIMENT.md)
+- [RTX 4090 SM89 optimization](SM89_OPTIMIZATION.md)
+- [Full optimization report](../../docs/cosmos_lite_optimization_report.md)

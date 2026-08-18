@@ -22,7 +22,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--require-cuda", action="store_true")
     parser.add_argument("--repo-root", type=Path)
+    parser.add_argument("--deployment-config", type=Path)
+    parser.add_argument("--bundle-dir", type=Path)
     args = parser.parse_args()
+    if (args.deployment_config is None) != (args.bundle_dir is None):
+        parser.error("--deployment-config and --bundle-dir must be provided together")
 
     modules = {
         name: importlib.import_module(name)
@@ -30,6 +34,8 @@ def main() -> None:
             "cosmos_framework",
             "cosmos_framework.model.attention.flash2",
             "cosmos_framework.model.attention.natten",
+            "cosmos_framework.scripts.action_policy_server_robolab",
+            "cosmos_framework.scripts.action_policy_server_robolab_deploy",
             "openpi_client",
             "openpi_server",
             "qwen_vl_utils",
@@ -88,7 +94,9 @@ def main() -> None:
                 "natten",
                 "openpi-client",
                 "openpi-server",
+                "sageattention",
                 "torch",
+                "triton",
                 "vllm",
             )
         },
@@ -96,6 +104,27 @@ def main() -> None:
         "marlin_gemm": True,
         "module_paths": module_paths,
     }
+    if args.deployment_config is not None and args.bundle_dir is not None:
+        from cosmos_framework.scripts.robolab_deployment_config import (
+            apply_cli_overrides,
+            load_deployment_config,
+            resolve_deployment_config,
+        )
+
+        requested = apply_cli_overrides(
+            load_deployment_config(args.deployment_config),
+            bundle_dir=args.bundle_dir,
+        )
+        resolution = resolve_deployment_config(requested)
+        result["deployment"] = {
+            "status": "compatible",
+            "profile": resolution.effective.profile,
+            "model_family": resolution.effective.model.family,
+            "strategy": resolution.effective.model.strategy,
+            "bundle_manifest_sha256": resolution.bundle_manifest_sha256,
+            "effective_runtime": resolution.effective.runtime.model_dump(mode="json"),
+            "fallback_decisions": resolution.fallback_decisions,
+        }
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

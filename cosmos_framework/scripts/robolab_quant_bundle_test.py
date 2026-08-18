@@ -130,6 +130,16 @@ def test_strategy_precision_maps_match_edge_release_counts() -> None:
     assert sum(_strategy_backend("full_w8a8", key)[0] == "VllmCutlassFp8W8A8Linear" for key in keys) == 336
 
 
+def test_public_bundle_equalizes_w4_but_keeps_fp8_dynamic() -> None:
+    module_name = "net.language_model.model.layers.0.mlp_moe_gen.up_proj"
+    stats = {module_name: torch.linspace(1.0, 2.0, 128)}
+    w4_target = bundle_module.QuantTarget("w4", module_name, "VllmGptqMarlinW4A16Linear", 4)
+    fp8_target = bundle_module.QuantTarget("fp8", module_name, "VllmCutlassFp8W8A8Linear", 8)
+
+    assert bundle_module._weight_input_scale(w4_target, stats, size_k=128, alpha=0.5) is not None
+    assert bundle_module._weight_input_scale(fp8_target, stats, size_k=128, alpha=0.5) is None
+
+
 def test_public_edge_manifest_uses_revision_uris_without_local_paths(tmp_path: Path) -> None:
     source = _manifest_source(
         source_root=tmp_path / "checkpoint",

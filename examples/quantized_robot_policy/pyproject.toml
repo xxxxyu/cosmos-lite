@@ -1,7 +1,7 @@
 [project]
 name = "cosmos-lite-robot-policy-runtime"
 version = "0.1.0"
-description = "Minimal runtime for Cosmos3 packed W4A16/W8A16 robot policies"
+description = "Minimal runtime for Cosmos3 W8A16 and GenW8A8 robot policies"
 requires-python = ">=3.13,<3.14"
 dependencies = [
   "cosmos-framework",

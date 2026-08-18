@@ -276,6 +276,20 @@ def _input_scale(stats: torch.Tensor, *, size_k: int, alpha: float) -> torch.Ten
     return normalized.pow(alpha).clamp(min=1e-2, max=1e2).to(torch.bfloat16)
 
 
+def _weight_input_scale(
+    target: QuantTarget,
+    stats: dict[str, torch.Tensor],
+    *,
+    size_k: int,
+    alpha: float,
+) -> torch.Tensor | None:
+    """Apply DROID input equalization only to calibrated W4A16 modules."""
+
+    if target.num_bits != 4 or target.module_name not in stats:
+        return None
+    return _input_scale(stats[target.module_name], size_k=size_k, alpha=alpha)
+
+
 def _portable_runtime_config(
     source_config: Path,
     target: Path,
@@ -398,7 +412,7 @@ def build_robolab_quant_bundle(
     for source_key, rel_path in weight_map.items():
         source_by_shard.setdefault(rel_path, []).append(source_key)
 
-    from cosmos_framework.inference.model import _diffusers_to_net_key
+    from cosmos_framework.inference.diffusers_weights import _diffusers_to_net_key
 
     try:
         for rel_path, source_keys in sorted(source_by_shard.items()):
@@ -420,13 +434,12 @@ def build_robolab_quant_bundle(
                     tensor = shard.get_tensor(source_key)
                     if target is not None:
                         weight = tensor.to(device=device, dtype=torch.bfloat16)
-                        input_scale = None
-                        if (
-                            target.num_bits == 4 or target.backend_class == "VllmCutlassFp8W8A8Linear"
-                        ) and target.module_name in stats:
-                            input_scale = _input_scale(
-                                stats[target.module_name], size_k=int(weight.shape[1]), alpha=calibration_alpha
-                            )
+                        input_scale = _weight_input_scale(
+                            target,
+                            stats,
+                            size_k=int(weight.shape[1]),
+                            alpha=calibration_alpha,
+                        )
                         if target.backend_class == "VllmCutlassFp8W8A8Linear":
                             backend = backend_module.VllmCutlassFp8W8A8Linear(weight, input_scale=input_scale)
                         elif target.num_bits == 8:
@@ -620,6 +633,8 @@ def build_robolab_quant_bundle(
                 "w8_modules": counts["w8"],
                 "w8a16_modules": counts["w8a16"],
                 "w8a8_modules": counts["w8a8"],
+                "activation_calibration": "dynamic_per_token_only" if counts["w8a8"] else "none",
+                "activation_calibration_alpha": None,
                 "calibration_stats": Path(calibration_stats).name if calibration_stats else "",
                 "calibration_stats_sha256": _sha256(Path(calibration_stats).expanduser()) if calibration_stats else "",
                 "calibration_alpha": calibration_alpha,
