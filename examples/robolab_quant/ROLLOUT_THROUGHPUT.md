@@ -17,8 +17,9 @@ and `--num-envs 10 --num-runs 1`. Keep policy and simulator processes alive
 across tasks, group tasks by USD scene, and stagger the first request from
 simulators sharing one policy server.
 
-| Model/profile | Policy + simulator GPUs | Simulator setting | First-request stagger per server | RoboLab-120 planning range | Existing quality gate |
+| Model/profile | Policy + simulator GPUs | Simulator setting | First-request stagger per server | RoboLab-120 time | Quality evidence |
 | --- | ---: | --- | --- | ---: | ---: |
+| Edge BF16, g3/s2 | 2P + 6S | 10 env x 1 run | `0/6/12s` | 5h35m17s measured | 251/1,200 (20.92%) |
 | Edge W8A16 | 2P + 6S | 10 env x 1 run | `0/6/12s` | 5.9-7.5h | Banana 36/50 (72%) |
 | **Edge GenW8A8** | **2P + 6S** | **10 env x 1 run** | **`0/4/8s`** | **5.3-7.1h** | **Banana 40/50 (80%)** |
 | Nano W8A16 | 3P + 5S | 10 env x 1 run | `0/18s` for two-client servers | 10.2-13.9h | Banana 45/50 (90%) |
@@ -26,8 +27,12 @@ simulators sharing one policy server.
 
 `P` means a policy-server GPU and `S` means an Isaac Sim GPU. Planning ranges
 are capacity estimates for 120 tasks x 10 episodes, not measured full-suite
-wall times. The quality gates are paired `BananaInBowlTask` rollouts, not an
-estimate of success on every RoboLab task.
+wall times. The quantized quality gates are paired `BananaInBowlTask` rollouts,
+not an estimate of success on every RoboLab task.
+
+The Edge BF16 row is a completed full-suite reference rather than a planning
+estimate. It directly loads NVIDIA's BF16 checkpoint and is included for
+reproduction and comparison; it is not the recommended throughput profile.
 
 ### Highest successful-rollout throughput
 
@@ -43,12 +48,55 @@ select GenW8A8 within that family.
 - Portable fallback: W8A16 needs no calibration and no optional SageAttention
   build, but completes fewer expected successful rollouts per unit time in the
   current gates.
-- BF16 reproduction remains a TODO and is not a release or topology gate.
+- Nano BF16 reproduction remains a TODO and is not a release or topology gate.
 
 This recommendation does not multiply a single-task success rate by a
 different task's throughput and present the result as a formal metric. Report
 successful rollouts per hour only from a matched task distribution and one
 recorded end-to-end run.
+
+## Edge BF16 Reference
+
+Edge BF16 fits on one RTX 4090 policy GPU and uses the same `2P + 6S` layout as
+the Edge quantized profiles. Both completed RoboLab-120 runs used 120 tasks,
+10 episodes per task, `10 env x 1 run` per simulator, a `0/6/12s` first-request
+stagger for each three-client server, shift 5, deterministic seed 0, JSON
+prompts, and all 32 generated actions executed at 15 Hz.
+
+| BF16 sampler | Evaluation wall time | Success rate | Successful rollouts/hour |
+| --- | ---: | ---: | ---: |
+| Guidance 3, 4 denoise steps | 9h20m57s | 260/1,200 (21.67%) | 27.8 |
+| Guidance 3, 2 denoise steps | 5h35m17s | 251/1,200 (20.92%) | 44.9 |
+
+The two-step BF16 run is the practical BF16 throughput reference. The
+four-step row is retained as the original comparison control. They ran on two
+different 8 x RTX 4090 hosts. The nearly 2x request-latency reduction is
+consistent with halving the denoise steps, while environment-time differences
+may also include host and trajectory effects. For comparison, Edge GenW8A8
+g3/s2 used the same `2P + 6S` protocol and completed in 4h51m15s with 231/1,200
+successes, or 47.6 successful rollouts/hour. It remains the measured Edge
+throughput winner, although the margin over BF16 g3/s2 is modest.
+
+BF16 does not use a quantized bundle or deployment YAML. Start each policy
+server directly from the local NVIDIA checkpoint:
+
+```bash
+CHECKPOINT=/data/cosmos_lite/Cosmos3-Edge-Policy-DROID
+POLICY_PY=examples/quantized_robot_policy/.venv/bin/python
+
+CUDA_VISIBLE_DEVICES=0 "$POLICY_PY" \
+  -m cosmos_framework.scripts.action_policy_server_robolab \
+  --checkpoint-path "$CHECKPOINT" \
+  --output-dir /data/runs/edge_bf16/server0 \
+  --profile-jsonl /data/runs/edge_bf16/server0/profile.jsonl \
+  --guidance 3 --num-steps 2 --shift 5 \
+  --seed 0 --deterministic-seed --format-prompt-as-json True \
+  --vae-encode-chunk-frames 8 --host 127.0.0.1 --port 8500
+```
+
+Start the second server on the other policy GPU and port, then launch the six
+simulator lanes with the same client command shown below. Use
+`--num-steps 4` only when reproducing the four-step control.
 
 ## What `--num-envs 10` Does
 
