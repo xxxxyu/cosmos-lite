@@ -408,7 +408,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["auto"],
         help="Backends to benchmark. Use 'auto' to let the frontend choose. "
-        "Named choices: flash2, flash3, natten, cudnn.",
+        "Named choices: flash2, flash3, natten, cudnn, sage.",
     )
     parser.add_argument("--seqlen", type=int, default=4096, help="Query sequence length.")
     parser.add_argument(

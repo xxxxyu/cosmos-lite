@@ -9,7 +9,7 @@ from cosmos_framework.model.attention import (
     multi_dimensional_attention_varlen,
 )
 from cosmos_framework.model.attention.masks import CausalType
-from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryValue
+from cosmos_framework.model.generator.utils.memory import ConditionKVCacheValue, KVToStore, MemoryValue
 
 
 class SplitInfo:
@@ -504,9 +504,34 @@ def dispatch_attention(
     memory_value: MemoryValue | None = None,
     packed_key_states_normalized: SequencePack | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
-    assert memory_value is None, "Base dispatch_attention does not handle MemoryValue"
     if not _is_split_info_compatible(attention_mask):
         raise TypeError(f"Unsupported attention metadata: {type(attention_mask)}")
+    if memory_value is not None and not isinstance(memory_value, ConditionKVCacheValue):
+        raise TypeError(f"Base dispatch_attention does not handle {type(memory_value).__name__}")
+    if isinstance(memory_value, ConditionKVCacheValue) and memory_value.frame_idx > 0:
+        if attention_mask.is_three_way or attention_mask.control_stream_token_ranges is not None:
+            raise ValueError("Condition K/V cache supports only two-way attention")
+        if natten_metadata is not None:
+            raise ValueError("Condition K/V cache does not support NATTEN")
+        cached_und_k = memory_value.und_k
+        cached_und_v = memory_value.und_v
+        if cached_und_k is None or cached_und_v is None:
+            raise ValueError("Condition K/V cache is missing understanding K/V tensors")
+
+        gen_q = get_full_only_seq(packed_query_states)[0]
+        gen_k = get_full_only_seq(packed_key_states)[0]
+        gen_v = get_full_only_seq(packed_value_states)[0]
+        full_res = attention(
+            gen_q.unsqueeze(0),
+            torch.cat([cached_und_k, gen_k.unsqueeze(0)], dim=1),
+            torch.cat([cached_und_v, gen_v.unsqueeze(0)], dim=1),
+        )
+        full_out = full_res.squeeze(0).flatten(-2, -1)
+        empty_und = full_out.new_empty((0, full_out.shape[-1]))
+        return from_mode_splits(empty_und, full_out, packed_query_states), None
+
+    # A frame-0 memory value only requests K/V capture. Attention math stays
+    # identical to the standard path; PackedAttentionMoT creates kv_to_store.
     if attention_mask.control_stream_token_ranges is not None:
         output = multi_control_two_way_attention(
             packed_query_states,

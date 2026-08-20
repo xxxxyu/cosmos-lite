@@ -16,18 +16,19 @@ from einops import rearrange
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.nn.modules.module import _IncompatibleKeys
 
-from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
-from cosmos_framework.utils.lazy_config import LazyDict
-from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
-from cosmos_framework.model._base import ImaginaireModel
-from cosmos_framework.utils import log, misc
-from cosmos_framework.utils.count_params import count_params
-from cosmos_framework.utils.timer import Timer
-from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
-from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
 from cosmos_framework.data.generator.action.action_processing import ActionProcessor, get_action_processing_records
+from cosmos_framework.data.generator.sequence_packing import (
+    PackedSequence,
+    SequencePlan,
+    build_sequence_plans_from_data_batch,
+    pack_input_sequence,
+)
+from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
 from cosmos_framework.data.generator.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
+from cosmos_framework.model._base import ImaginaireModel
+from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
+from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.model.generator.diffusion.rectified_flow import RectifiedFlow
 from cosmos_framework.model.generator.diffusion.samplers.edm import EDMSampler
 from cosmos_framework.model.generator.diffusion.samplers.fixed_step import FixedStepSampler
@@ -37,6 +38,8 @@ from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMN
 from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
 from cosmos_framework.model.generator.mot.parallelize_vfm_network import parallelize_vfm_network
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
+from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
+from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
 from cosmos_framework.model.generator.utils.data_and_condition import (
     GenerationDataClean,
     GenerationDataNoised,
@@ -44,7 +47,7 @@ from cosmos_framework.model.generator.utils.data_and_condition import (
     build_dense_sound_schedule,
     unwrap_and_densify,
 )
-from cosmos_framework.model.generator.utils.memory import MemoryState
+from cosmos_framework.model.generator.utils.memory import ConditionKVCacheState, MemoryState
 from cosmos_framework.model.generator.utils.moe_utils import (
     sync_expert_biases_to_ema,
     sync_router_biases_to_ema,
@@ -56,19 +59,16 @@ from cosmos_framework.model.generator.utils.moe_utils import (
 from cosmos_framework.model.generator.utils.safetensors_loader import (
     load_language_model as load_language_model_safetensors,
 )
-from cosmos_framework.data.generator.sequence_packing import (
-    PackedSequence,
-    SequencePlan,
-    build_sequence_plans_from_data_batch,
-    pack_input_sequence,
-)
-from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
-from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
-from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
+from cosmos_framework.utils import log, misc
+from cosmos_framework.utils.count_params import count_params
+from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
 from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelUpdater
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
+from cosmos_framework.utils.lazy_config import LazyDict
+from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
+from cosmos_framework.utils.timer import Timer
 
 
 class OmniMoTModel(ImaginaireModel):
@@ -1917,6 +1917,7 @@ class OmniMoTModel(ImaginaireModel):
         sequence_plans: list[SequencePlan],
         gen_data_clean: GenerationDataClean,
         skip_text_tokens: bool = False,
+        memory: MemoryState | None = None,
     ) -> list[torch.Tensor]:
         """
         Compute velocity prediction for a single sampling step.
@@ -2040,6 +2041,7 @@ class OmniMoTModel(ImaginaireModel):
         out = self.denoise(
             net=net,
             data_batch_packed=packed_sequence,
+            memory=memory,
         )
 
         # --- Apply velocity masks ---
@@ -2190,7 +2192,9 @@ class OmniMoTModel(ImaginaireModel):
         cond_tokens: list[list[int]],
         uncond_tokens: list[list[int]],
         skip_text_tokens_for_cfg: bool,
-        single_velocity_fn: Callable[[list[list[int]], bool], list[torch.Tensor]],
+        single_velocity_fn: Callable[[list[list[int]], bool, MemoryState | None], list[torch.Tensor]],
+        cond_memory: MemoryState | None = None,
+        uncond_memory: MemoryState | None = None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Run classifier-free guidance, optionally in parallel via CFG parallelism.
 
@@ -2200,8 +2204,10 @@ class OmniMoTModel(ImaginaireModel):
             skip_text_tokens_for_cfg: If True, skip text tokens in the
                 unconditional branch.
             single_velocity_fn: Computes velocity for a given set of tokens.
-                Accepts ``(tokens, skip_text_tokens)`` and returns a list of
-                velocity tensors (one per sample).
+                Accepts ``(tokens, skip_text_tokens, memory)`` and returns a
+                list of velocity tensors (one per sample).
+            cond_memory: Request-local cache for the conditional branch.
+            uncond_memory: Request-local cache for the unconditional branch.
 
         Returns:
             A tuple ``(cond_v, uncond_v)`` where each element is a list of
@@ -2209,8 +2215,8 @@ class OmniMoTModel(ImaginaireModel):
         """
         if self.parallel_dims is None or not self.parallel_dims.cfgp_enabled:
             return (
-                single_velocity_fn(cond_tokens, False),
-                single_velocity_fn(uncond_tokens, skip_text_tokens_for_cfg),
+                single_velocity_fn(cond_tokens, False, cond_memory),
+                single_velocity_fn(uncond_tokens, skip_text_tokens_for_cfg, uncond_memory),
             )
 
         cfgp_rank = self.parallel_dims.cfgp_rank
@@ -2219,9 +2225,9 @@ class OmniMoTModel(ImaginaireModel):
         cfgp_peer = (cfgp_rank + 1) % cfgp_size
 
         if cfgp_rank == 0:
-            v_list = single_velocity_fn(cond_tokens, False)
+            v_list = single_velocity_fn(cond_tokens, False, cond_memory)
         else:
-            v_list = single_velocity_fn(uncond_tokens, skip_text_tokens_for_cfg)
+            v_list = single_velocity_fn(uncond_tokens, skip_text_tokens_for_cfg, uncond_memory)
 
         other_v_list = [torch.empty_like(v_i) for v_i in v_list]
 
@@ -2268,6 +2274,7 @@ class OmniMoTModel(ImaginaireModel):
         upsample_repetition_penalty: float = 1.0,
         upsample_presence_penalty: float = 0.0,
         upsample_seed: int | None = None,
+        condition_kv_cache: bool = False,
         **kwargs,
     ) -> dict[str, list[torch.Tensor]]:
         """
@@ -2407,6 +2414,17 @@ class OmniMoTModel(ImaginaireModel):
 
         assert n_sample == len(seed), f"Number of samples {n_sample} must match number of seeds {len(seed)}"
 
+        if condition_kv_cache:
+            if n_sample != 1:
+                raise ValueError("Condition K/V cache currently supports only batch size 1")
+            if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
+                raise ValueError("Condition K/V cache currently does not support context parallelism")
+            cond_memory: MemoryState | None = ConditionKVCacheState()
+            uncond_memory: MemoryState | None = ConditionKVCacheState()
+        else:
+            cond_memory = None
+            uncond_memory = None
+
         # Optional per-step velocity postprocess hook. Built once via a builder
         # that receives the prepared inference state. The returned callable (if
         # any) is invoked after the conditional forward on every step and can
@@ -2474,7 +2492,9 @@ class OmniMoTModel(ImaginaireModel):
             # Expand timestep to (B, 1)
             timestep = timestep.repeat(len(noise_x), 1)
 
-            def _single_velocity_fn(tokens: list[list[int]], skip_text_tokens: bool):
+            def _single_velocity_fn(
+                tokens: list[list[int]], skip_text_tokens: bool, memory: MemoryState | None = None
+            ):
                 return self._get_velocity(
                     net=net,
                     noise_x=noise_x,
@@ -2483,6 +2503,7 @@ class OmniMoTModel(ImaginaireModel):
                     sequence_plans=sequence_plans,
                     gen_data_clean=gen_data_clean,
                     skip_text_tokens=skip_text_tokens,
+                    memory=memory,
                 )
 
             needs_text_cfg = guidance != 1.0
@@ -2503,7 +2524,7 @@ class OmniMoTModel(ImaginaireModel):
 
             # Fast path: no text-CFG anywhere and no postprocess hook — single forward.
             if not _any_needs_text_cfg and velocity_postprocess is None:
-                return _single_velocity_fn(cond_tokens, skip_text_tokens=False)
+                return _single_velocity_fn(cond_tokens, skip_text_tokens=False, memory=cond_memory)
 
             # Fast path: only text-CFG and no postprocess — preserve the
             # cfgp-parallel branch so two-rank CFG parallelism stays available.
@@ -2513,6 +2534,8 @@ class OmniMoTModel(ImaginaireModel):
                     uncond_tokens=uncond_tokens,
                     skip_text_tokens_for_cfg=skip_text_tokens_for_cfg,
                     single_velocity_fn=_single_velocity_fn,
+                    cond_memory=cond_memory,
+                    uncond_memory=uncond_memory,
                 )
                 if not needs_text_cfg:
                     # Peers needed CFG so we ran the uncond forward to keep
@@ -2528,10 +2551,14 @@ class OmniMoTModel(ImaginaireModel):
 
             # Conditional forward, then per-step postprocess hook. Hook runs
             # sequentially; cfgp parallelism not used on this path.
-            cond_v_full = _single_velocity_fn(cond_tokens, skip_text_tokens=False)
+            cond_v_full = _single_velocity_fn(cond_tokens, skip_text_tokens=False, memory=cond_memory)
             cond_v = velocity_postprocess(cond_v_full, noise_x, timestep)
 
-            uncond_v = _single_velocity_fn(uncond_tokens, skip_text_tokens=skip_text_tokens_for_cfg)
+            uncond_v = _single_velocity_fn(
+                uncond_tokens,
+                skip_text_tokens=skip_text_tokens_for_cfg,
+                memory=uncond_memory,
+            )
             if not needs_text_cfg:
                 # Same alignment story as above for the postprocess branch.
                 return cond_v

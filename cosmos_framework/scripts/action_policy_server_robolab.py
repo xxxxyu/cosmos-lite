@@ -25,10 +25,13 @@ from cosmos_framework.inference.common.init import init_script
 
 init_script()
 
+import asyncio
 import json
+import os
 import socket
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -64,7 +67,11 @@ from cosmos_framework.scripts.robolab_quant_bundle import (
     materialize_robolab_bundle_config,
     validate_robolab_quant_bundle,
 )
-from cosmos_framework.scripts.robolab_quant_runtime import QuantLinearWithOptionalBias, RobolabDirectQuantLoader
+from cosmos_framework.scripts.robolab_quant_runtime import (
+    QuantLinearWithOptionalBias,
+    RobolabDirectQuantLoader,
+    flush_quant_linear_shapes,
+)
 from cosmos_framework.utils import log
 from cosmos_framework.utils.checkpoint_db import CheckpointDirHf
 from cosmos_framework.utils.lazy_config import instantiate
@@ -319,6 +326,53 @@ def _load_openpi_websocket_policy_server() -> type[Any]:
     return WebsocketPolicyServer
 
 
+def _responsive_openpi_websocket_policy_server(base_cls: type[Any]) -> type[Any]:
+    """Keep WebSocket control traffic responsive during long first-request compilation."""
+
+    import websockets
+    import websockets.frames
+    from openpi_client import msgpack_numpy
+
+    class ResponsiveWebsocketPolicyServer(base_cls):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._inference_lock = asyncio.Lock()
+            self._first_inference_complete = False
+
+        async def _handler(self, websocket: Any) -> None:
+            packer = msgpack_numpy.Packer()
+            await websocket.send(packer.pack(self._metadata))
+            prev_total_time = None
+            while True:
+                try:
+                    start_time = time.monotonic()
+                    obs = msgpack_numpy.unpackb(await websocket.recv())
+                    infer_start = time.monotonic()
+                    async with self._inference_lock:
+                        if self._first_inference_complete:
+                            action = self._policy.infer(obs)
+                        else:
+                            action = await asyncio.to_thread(self._policy.infer, obs)
+                            self._first_inference_complete = True
+                    infer_time = time.monotonic() - infer_start
+                    action["server_timing"] = {"infer_ms": infer_time * 1000}
+                    if prev_total_time is not None:
+                        action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
+                    await websocket.send(packer.pack(action))
+                    prev_total_time = time.monotonic() - start_time
+                except websockets.ConnectionClosed:
+                    break
+                except Exception:
+                    await websocket.send(traceback.format_exc())
+                    await websocket.close(
+                        code=websockets.frames.CloseCode.INTERNAL_ERROR,
+                        reason="Internal server error. Traceback included in previous frame.",
+                    )
+                    raise
+
+    return ResponsiveWebsocketPolicyServer
+
+
 class _DummyDataset(torch.utils.data.IterableDataset):
     def __iter__(self) -> Any:
         return iter(())
@@ -338,11 +392,13 @@ class RobolabPolicyConfig:
     resolution: str | None
     action_chunk_size: int
     action_dim: int
+    condition_kv_cache: bool = False
     image_height: int = _DEFAULT_IMAGE_HEIGHT
     image_width: int = _DEFAULT_IMAGE_WIDTH
     action_space: ActionSpace = "joint_pos"
     use_state: bool = True
     history_length: int = 1
+    sparse_video_transform: bool = True
 
 
 class RobolabServerArgs(pydantic.BaseModel):
@@ -388,6 +444,20 @@ class RobolabServerArgs(pydantic.BaseModel):
     """Diffusion sampler used by OmniInference."""
     use_torch_compile: bool = False
     """Compile the inference graph. Disabled by default for predictable single-robot latency."""
+    use_cuda_graphs: bool = False
+    """Use Inductor CUDA Graphs inside compiled MoT blocks. Requires --use-torch-compile."""
+    compiled_region: Literal["all", "language"] = "language"
+    """Compile MoT language blocks only, or also compile the VFM encode/decode heads."""
+    compile_dynamic: bool = True
+    """Use symbolic-shape compiled MoT kernels. Required for varying policy prompt lengths."""
+    fp8_projection_fusion: Literal["none", "shared"] = "none"
+    """Share FP8 activation quantization across eligible QKV and gated-MLP projections."""
+    fp8_gemm_backend: Literal["cutlass", "triton_sm89"] = "cutlass"
+    """FP8 GEMM backend; the tuned Triton path supports validated Edge Gen shapes on SM89."""
+    condition_kv_cache: bool = False
+    """Reuse invariant understanding K/V across denoising steps (experimental, batch size 1)."""
+    sparse_video_transform: bool = True
+    """Resize the observed frame only, then allocate zero future frames at the target resolution."""
 
     seed: int = 0
     """Base generation seed used to initialize the request RNG."""
@@ -426,6 +496,16 @@ class RobolabPolicyService:
     def __init__(self, args: RobolabServerArgs) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for OmniMoTModel inference in this repo.")
+        if args.use_cuda_graphs and not args.use_torch_compile:
+            raise ValueError("--use-cuda-graphs requires --use-torch-compile")
+        if args.use_torch_compile and os.environ.get("COSMOS3_LINEAR_SHAPES_JSONL"):
+            raise ValueError("MoT fullgraph compile is incompatible with COSMOS3_LINEAR_SHAPES_JSONL")
+        if args.fp8_projection_fusion != "none" and os.environ.get("COSMOS3_LINEAR_SHAPES_JSONL"):
+            raise ValueError("FP8 projection fusion is incompatible with COSMOS3_LINEAR_SHAPES_JSONL")
+        if args.fp8_projection_fusion != "none" and args.calibration_stats_output is not None:
+            raise ValueError("FP8 projection fusion is incompatible with online calibration-stat collection")
+        if args.fp8_gemm_backend == "triton_sm89" and not args.use_torch_compile:
+            raise ValueError("The tuned SM89 Triton FP8 backend requires --use-torch-compile")
         load_start = time.perf_counter()
         self._profile_jsonl = args.profile_jsonl.expanduser().resolve() if args.profile_jsonl is not None else None
         self._quant_loader: RobolabDirectQuantLoader | None = None
@@ -440,7 +520,11 @@ class RobolabPolicyService:
             _configure_quant_vae_runtime(materialized_config, args)
             config_file_override = str(materialized_config)
             args = args.model_copy(update={"checkpoint_path": str(quant_root)})
-            self._quant_loader = RobolabDirectQuantLoader(quant_root)
+            self._quant_loader = RobolabDirectQuantLoader(
+                quant_root,
+                fp8_projection_fusion=args.fp8_projection_fusion,
+                fp8_gemm_backend=args.fp8_gemm_backend,
+            )
             self._quant_loader.install()
             _write_profile_event(
                 self._profile_jsonl,
@@ -450,6 +534,8 @@ class RobolabPolicyService:
                 modules=validation["modules"],
                 residual_state_keys=validation["residual_state_keys"],
                 bundle_bytes=validation["bundle_bytes"],
+                fp8_projection_fusion=args.fp8_projection_fusion,
+                fp8_gemm_backend=args.fp8_gemm_backend,
             )
         else:
             resolved_checkpoint_path = _resolve_checkpoint_path(args.checkpoint_path, hf_revision=args.hf_revision)
@@ -487,6 +573,8 @@ class RobolabPolicyService:
             guidance=float(args.guidance),
             num_steps=int(args.num_steps),
             shift=float(args.shift),
+            condition_kv_cache=bool(args.condition_kv_cache),
+            sparse_video_transform=bool(args.sparse_video_transform),
             conditioning_fps=float(
                 args.conditioning_fps or inferred.get("conditioning_fps") or _DEFAULT_CONDITIONING_FPS
             ),
@@ -532,6 +620,7 @@ class RobolabPolicyService:
             f"chunk={self.cfg.action_chunk_size} history={self.cfg.history_length} use_state={self.cfg.use_state} "
             f"image={self.cfg.image_height}x{self.cfg.image_width} fps={self.cfg.conditioning_fps} "
             f"guidance={self.cfg.guidance} num_steps={self.cfg.num_steps} shift={self.cfg.shift} "
+            f"condition_kv_cache={self.cfg.condition_kv_cache} "
             f"seed={self.cfg.seed} deterministic_seed={self.cfg.deterministic_seed}"
         )
         _write_profile_event(
@@ -541,6 +630,19 @@ class RobolabPolicyService:
             num_steps=self.cfg.num_steps,
             action_chunk_size=self.cfg.action_chunk_size,
             vae_encode_chunk_frames=args.vae_encode_chunk_frames,
+            use_torch_compile=args.use_torch_compile,
+            use_cuda_graphs=args.use_cuda_graphs,
+            compiled_region=args.compiled_region,
+            compile_dynamic=args.compile_dynamic,
+            fp8_projection_fusion=args.fp8_projection_fusion,
+            fp8_gemm_backend=args.fp8_gemm_backend,
+            sage_attention_requested=os.environ.get("COSMOS3_SAGE_ATTENTION", "0") == "1",
+            sage_pv=os.environ.get("COSMOS3_SAGE_PV", "fp8_fp32_fp32"),
+            condition_kv_cache=args.condition_kv_cache,
+            sparse_video_transform=args.sparse_video_transform,
+            fp8_projection_groups=(
+                self._quant_loader.fp8_projection_groups if self._quant_loader is not None else None
+            ),
         )
 
     def _install_calibration_hooks(self) -> None:
@@ -590,6 +692,9 @@ class RobolabPolicyService:
             "sampler": args.sampler,
             "guardrails": args.guardrails,
             "use_torch_compile": args.use_torch_compile,
+            "use_cuda_graphs": args.use_cuda_graphs,
+            "compiled_region": args.compiled_region,
+            "compile_dynamic": args.compile_dynamic,
         }
         if config_file_override is not None:
             setup_overrides["config_file"] = config_file_override
@@ -680,8 +785,14 @@ class RobolabPolicyService:
         if image.shape[:2] != (image_h, image_w):
             image = _resize_rgb_uint8(image, (image_h, image_w))
         t_frames = self.cfg.action_chunk_size + 1
-        video = torch.zeros((3, t_frames, image_h, image_w), dtype=torch.uint8)  # [3,T,H,W]
-        video[:, 0] = torch.from_numpy(image.copy()).permute(2, 0, 1)  # [3,H,W]
+        first_frame = torch.from_numpy(image.copy()).permute(2, 0, 1)  # [3,H,W]
+        spatial_metadata: torch.Tensor | None = None
+        if self.cfg.sparse_video_transform and isinstance(self._transform, ActionTransformPipeline):
+            frame_sample = self._transform.video_resize({"video": first_frame}, self.cfg.resolution)
+            first_frame = frame_sample["video"]
+            spatial_metadata = frame_sample["image_size"]
+        video = torch.zeros((3, t_frames, *first_frame.shape[-2:]), dtype=torch.uint8)  # [3,T,H,W]
+        video[:, 0] = first_frame
 
         use_state_rows = 1 if self.cfg.use_state else 0
         action = torch.zeros(
@@ -735,17 +846,29 @@ class RobolabPolicyService:
         if history_action is not None:
             sample["history_action"] = history_action
         sample = self._transform(sample, self.cfg.resolution)
+        if spatial_metadata is not None:
+            sample["image_size"] = spatial_metadata
         if isinstance(sample.get("ai_caption"), dict):
             sample["ai_caption"] = json.dumps(sample["ai_caption"])
         return sample
 
     def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
         request_start = time.perf_counter()
+        build_sample_start = time.perf_counter()
         sample = self._build_sample(obs)
+        build_sample_ms = (time.perf_counter() - build_sample_start) * 1000.0
+        build_batch_start = time.perf_counter()
         data_batch = _build_data_batch_from_sample(sample)
+        build_batch_ms = (time.perf_counter() - build_batch_start) * 1000.0
         seed = self._next_seed()
         log.info(f"[robolab-policy-server] prompt={data_batch['ai_caption'][0]!r} seed={seed}")
 
+        generate_start_event: torch.cuda.Event | None = None
+        generate_end_event: torch.cuda.Event | None = None
+        if self._profile_jsonl is not None:
+            generate_start_event = torch.cuda.Event(enable_timing=True)
+            generate_end_event = torch.cuda.Event(enable_timing=True)
+            generate_start_event.record()
         generate_start = time.perf_counter()
         with self._lock:
             with torch.inference_mode():
@@ -755,12 +878,23 @@ class RobolabPolicyService:
                     seed=[seed],
                     num_steps=self.cfg.num_steps,
                     shift=self.cfg.shift,
+                    condition_kv_cache=self.cfg.condition_kv_cache,
                 )
         generate_ms = (time.perf_counter() - generate_start) * 1000.0
+        if generate_end_event is not None:
+            generate_end_event.record()
 
         action = samples["action"][0][:, : self.cfg.action_dim]  # [T,D]
         action = action[self.cfg.history_length :]  # [T2,D]
+        action_transfer_start = time.perf_counter()
         action_np = action.detach().cpu().numpy()  # [T2,D]
+        action_transfer_ms = (time.perf_counter() - action_transfer_start) * 1000.0
+        generate_cuda_ms = (
+            generate_start_event.elapsed_time(generate_end_event)
+            if generate_start_event is not None and generate_end_event is not None
+            else None
+        )
+        postprocess_start = time.perf_counter()
         action_np[:, -1] = 1.0 - action_np[:, -1]
 
         if self.cfg.action_space == "midtrain":
@@ -785,16 +919,23 @@ class RobolabPolicyService:
             video = self.model.decode(pred_vision_latent)  # [1,C,T,H,W]
             video = ((video[0].clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 3, 0)  # [T,H,W,3]
             outputs["video"] = video.detach().cpu().numpy()
+        postprocess_ms = (time.perf_counter() - postprocess_start) * 1000.0
         _write_profile_event(
             self._profile_jsonl,
             "request",
             seed=seed,
+            build_sample_ms=build_sample_ms,
+            build_batch_ms=build_batch_ms,
             generate_ms=generate_ms,
+            generate_cuda_ms=generate_cuda_ms,
+            action_transfer_ms=action_transfer_ms,
+            postprocess_ms=postprocess_ms,
             request_ms=(time.perf_counter() - request_start) * 1000.0,
             action_rows=int(action_np.shape[0]),
         )
         self._capture(obs, outputs)
         self._flush_calibration_stats()
+        flush_quant_linear_shapes()
         return outputs
 
 
@@ -805,7 +946,7 @@ def serve(args: RobolabServerArgs) -> None:
     local_ip = get_local_ip()
     log.info(f"[robolab-policy-server] Server accessible at: ws://{local_ip}:{int(args.port)}/")
     log.info(f"[robolab-policy-server] Health check: http://{local_ip}:{int(args.port)}/healthz")
-    server_cls = _load_openpi_websocket_policy_server()
+    server_cls = _responsive_openpi_websocket_policy_server(_load_openpi_websocket_policy_server())
     server_cls(policy=service, host=args.host, port=int(args.port), metadata={}).serve_forever()
 
 

@@ -5,7 +5,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import sys
+import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -74,6 +78,79 @@ def test_load_openpi_websocket_policy_server_from_lightweight_package(monkeypatc
     assert robolab_server._load_openpi_websocket_policy_server() is FakeWebsocketPolicyServer
 
 
+def test_responsive_websocket_server_offloads_only_first_inference() -> None:
+    from openpi_client import msgpack_numpy
+
+    first_inference_started = threading.Event()
+    release_first_inference = threading.Event()
+
+    class FakePolicy:
+        def __init__(self) -> None:
+            self.thread_ids: list[int] = []
+
+        def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
+            self.thread_ids.append(threading.get_ident())
+            if len(self.thread_ids) == 1:
+                first_inference_started.set()
+                assert release_first_inference.wait(timeout=1.0)
+            return {"actions": np.asarray([[obs["request"]]], dtype=np.float32)}
+
+    class FakeBaseServer:
+        def __init__(self, policy: Any, metadata: dict[str, Any]) -> None:
+            self._policy = policy
+            self._metadata = metadata
+
+    class FakeWebsocket:
+        def __init__(self) -> None:
+            packer = msgpack_numpy.Packer()
+            self._requests = [packer.pack({"request": 1}), packer.pack({"request": 2})]
+            self.sent: list[bytes] = []
+            self.responses_complete = asyncio.Event()
+            self.wait_forever = asyncio.Event()
+
+        async def recv(self) -> bytes:
+            if self._requests:
+                return self._requests.pop(0)
+            await self.wait_forever.wait()
+            raise AssertionError("unreachable")
+
+        async def send(self, payload: bytes) -> None:
+            self.sent.append(payload)
+            if len(self.sent) == 3:
+                self.responses_complete.set()
+
+    async def exercise_server() -> None:
+        policy = FakePolicy()
+        server_cls = robolab_server._responsive_openpi_websocket_policy_server(FakeBaseServer)
+        server = server_cls(policy=policy, metadata={"model": "test"})
+        websocket = FakeWebsocket()
+        event_loop_thread = threading.get_ident()
+        handler = asyncio.create_task(server._handler(websocket))
+
+        try:
+            assert await asyncio.to_thread(first_inference_started.wait, 0.5)
+            await asyncio.sleep(0)
+            assert len(websocket.sent) == 1
+            release_first_inference.set()
+            await asyncio.wait_for(websocket.responses_complete.wait(), timeout=1.0)
+
+            assert policy.thread_ids[0] != event_loop_thread
+            assert policy.thread_ids[1] == event_loop_thread
+            first_response = msgpack_numpy.unpackb(websocket.sent[1])
+            second_response = msgpack_numpy.unpackb(websocket.sent[2])
+            assert first_response["actions"].item() == 1
+            assert second_response["actions"].item() == 2
+            assert first_response["server_timing"]["infer_ms"] >= 0
+            assert second_response["server_timing"]["prev_total_ms"] >= 0
+        finally:
+            release_first_inference.set()
+            handler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handler
+
+    asyncio.run(exercise_server())
+
+
 def test_server_args_default_to_released_droid_serving_config() -> None:
     args = robolab_server.RobolabServerArgs()
 
@@ -81,6 +158,13 @@ def test_server_args_default_to_released_droid_serving_config() -> None:
     assert args.host == "127.0.0.1"
     assert args.guardrails is False
     assert args.use_torch_compile is False
+    assert args.use_cuda_graphs is False
+    assert args.compiled_region == "language"
+    assert args.compile_dynamic is True
+    assert args.fp8_projection_fusion == "none"
+    assert args.fp8_gemm_backend == "cutlass"
+    assert args.condition_kv_cache is False
+    assert args.sparse_video_transform is True
     assert args.vae_encode_chunk_frames == 8
     assert args.hf_revision == "main"
     assert args.domain_name == "droid_lerobot"
@@ -143,6 +227,59 @@ def test_joint_pos_observation_preprocessing_matches_internal_layout() -> None:
     np.testing.assert_allclose(sample["history_action"][0].numpy(), np.concatenate([joint_position[0], [0.8]]))
     assert sample["ai_caption"] == "open the drawer"
     assert sample["viewpoint"] == "concat_view"
+
+
+def test_sparse_policy_video_transform_matches_full_video_transform() -> None:
+    config = robolab_server.RobolabPolicyConfig(
+        checkpoint_path="unused",
+        domain_name="droid_lerobot",
+        decode_video=False,
+        seed=0,
+        deterministic_seed=True,
+        guidance=3.0,
+        num_steps=2,
+        shift=5.0,
+        conditioning_fps=15.0,
+        resolution="256",
+        action_chunk_size=4,
+        action_dim=8,
+        image_height=4,
+        image_width=5,
+        action_space="joint_pos",
+        use_state=True,
+        history_length=1,
+    )
+    obs = {
+        "prompt": "open the drawer",
+        "observation/image": np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3),
+        "observation/joint_position": np.arange(7, dtype=np.float32),
+        "observation/gripper_position": np.array([0.25], dtype=np.float32),
+    }
+    fast_pipeline = robolab_server.ActionTransformPipeline(max_action_dim=64, cfg_dropout_rate=0.0)
+    legacy_pipeline = robolab_server.ActionTransformPipeline(max_action_dim=64, cfg_dropout_rate=0.0)
+    fast_service = object.__new__(robolab_server.RobolabPolicyService)
+    fast_service.cfg = config
+    fast_service._transform = fast_pipeline
+    legacy_service = object.__new__(robolab_server.RobolabPolicyService)
+    legacy_service.cfg = config
+    legacy_service._transform = lambda sample, resolution: legacy_pipeline(sample, resolution)
+    rollback_service = object.__new__(robolab_server.RobolabPolicyService)
+    rollback_service.cfg = replace(config, sparse_video_transform=False)
+    rollback_service._transform = robolab_server.ActionTransformPipeline(max_action_dim=64, cfg_dropout_rate=0.0)
+
+    fast = robolab_server.RobolabPolicyService._build_sample(fast_service, obs)
+    legacy = robolab_server.RobolabPolicyService._build_sample(legacy_service, obs)
+    rollback = robolab_server.RobolabPolicyService._build_sample(rollback_service, obs)
+
+    assert fast.keys() == legacy.keys()
+    for key, expected in legacy.items():
+        actual = fast[key]
+        if isinstance(expected, torch.Tensor):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(rollback[key], expected, rtol=0, atol=0)
+        else:
+            assert actual == expected
+            assert rollback[key] == expected
 
 
 def test_build_data_batch_wraps_multi_item_keys_like_internal_server() -> None:

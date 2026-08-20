@@ -26,6 +26,7 @@ from cosmos_framework.model.attention.flash2 import flash2_attention
 from cosmos_framework.model.attention.flash3 import flash3_attention
 from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.attention.natten import natten_attention, natten_multi_dim_attention
+from cosmos_framework.model.attention.sage import sage_attention
 from cosmos_framework.model.attention.utils.environment import filter_attention_merge_backends
 from cosmos_framework.model.attention.utils.safe_ops import log
 
@@ -35,6 +36,7 @@ BACKEND_MAP = {
     "natten": natten_attention,
     "flash2": flash2_attention,
     "flash3": flash3_attention,
+    "sage": sage_attention,
 }
 
 MULTI_DIM_BACKEND_MAP = {
@@ -217,6 +219,7 @@ def attention(
         deterministic=deterministic,
         backend=backend,
         raise_error=False,
+        excluded_backends=("sage",) if return_lse else (),
     )
 
     # Either incompatible backend specified by user, or no compatible backends found
