@@ -1,0 +1,2018 @@
+From b8e2ae0684012acc84281c086e64decc0323c4ce Mon Sep 17 00:00:00 2001
+From: Xiangyu Li <xiangyu.sdlc@foxmail.com>
+Date: Thu, 20 Aug 2026 11:40:21 +0800
+Subject: [PATCH] Add training-ready Cosmos-DROID trajectory export
+
+---
+ docs/cosmos_droid_trajectories.md             | 157 +++++
+ docs/data.md                                  |   5 +
+ .../configs/droid_lerobot_trajectory.yaml     |  26 +
+ pyproject.toml                                |  15 +-
+ .../core/logging/droid_lerobot_trajectory.py  | 534 ++++++++++++++++++
+ robolab/core/logging/lerobot_trajectory.py    | 339 +++++++++++
+ robolab/core/utils/video_utils.py             | 123 +++-
+ robolab/eval/episode.py                       |  35 +-
+ robolab/eval/runner.py                        |  26 +
+ robolab/tools/__init__.py                     |   2 +
+ robolab/tools/validate_droid_trajectory.py    | 166 ++++++
+ tests/test_droid_lerobot_trajectory.py        | 263 +++++++++
+ tests/test_recorder_cpu_streaming.py          |  58 ++
+ 13 files changed, 1740 insertions(+), 9 deletions(-)
+ create mode 100644 docs/cosmos_droid_trajectories.md
+ create mode 100644 examples/configs/droid_lerobot_trajectory.yaml
+ create mode 100644 robolab/core/logging/droid_lerobot_trajectory.py
+ create mode 100644 robolab/core/logging/lerobot_trajectory.py
+ create mode 100644 robolab/tools/__init__.py
+ create mode 100644 robolab/tools/validate_droid_trajectory.py
+ create mode 100644 tests/test_droid_lerobot_trajectory.py
+
+diff --git a/docs/cosmos_droid_trajectories.md b/docs/cosmos_droid_trajectories.md
+new file mode 100644
+index 0000000..56abd0e
+--- /dev/null
++++ b/docs/cosmos_droid_trajectories.md
+@@ -0,0 +1,157 @@
++# Cosmos-DROID Training Trajectories
++
++RoboLab can write successful Cosmos3 rollouts directly as a LeRobot v3 dataset
++for DROID joint-position policy training. This path is separate from RoboLab's
++normal evaluation output:
++
++- `episode_results.jsonl` reports evaluation outcomes;
++- `success/` contains the training rows and H.264 camera streams;
++- HDF5 and JSON sidecars retain simulator state needed for reproduction and
++  debugging, but are not the primary training format.
++
++## Install
++
++Install the optional trajectory dependencies in the same Python 3.11
++environment as RoboLab:
++
++```bash
++uv sync --extra isaac50 --extra trajectory
++```
++
++Isaac Sim pins `packaging==23.0`, while the validated LeRobot fork declares
++`packaging>=24.2`. RoboLab's `uv` override keeps Isaac Sim's required version;
++the LeRobot v3 dataset APIs used here are covered by the recorder tests on that
++version. Keep the pinned LeRobot commit until this compatibility constraint is
++resolved upstream.
++
++## Configure
++
++Copy and edit `examples/configs/droid_lerobot_trajectory.yaml`. At minimum,
++set `checkpoint` to the exact Hugging Face model ID, local bundle digest, or
++other immutable identifier used by the policy server. The recorder rejects an
++unset checkpoint.
++
++The training contract is fixed to match Cosmos-DROID:
++
++| Field | Value |
++| --- | --- |
++| RGB | left shoulder, right shoulder, and wrist |
++| Image format | `640x360`, RGB `uint8`, H.264, 15 FPS |
++| State | 7 joint positions, 1 gripper position, 6 Cartesian values |
++| Action | 7 joint-position commands, 1 gripper command |
++| Alignment | `observation[t] -> executed_action[t]` |
++| Selection | successful episodes only |
++
++The recorder converts RoboLab's gripper convention to raw DROID once. Cosmos'
++DROID loader performs its usual single transform when reading the result.
++
++RoboLab keeps the media writer and the Cosmos-DROID preset separate:
++
++- `robolab/core/logging/lerobot_trajectory.py` provides configurable stream
++  mappings, feature schemas, image sizes, FPS, codec, quality, encoder threads
++  per stream, queue size, and FFmpeg options for custom LeRobot recorders.
++- `droid_lerobot_trajectory.py` supplies the three DROID cameras and the fixed
++  state/action schema above. Its YAML rejects other resolutions, frame rates,
++  and codecs because the result is intended for the current Cosmos loader.
++
++Use the generic layer when building a different dataset contract. The
++`--trajectory-config` CLI currently selects the Cosmos-DROID preset.
++
++## Collect
++
++Start the Cosmos Lite server normally, then pass the YAML to RoboLab:
++
++```bash
++python policies/cosmos3/run.py \
++  --task BananaOnPlateTask \
++  --num-envs 10 --num-runs 1 \
++  --remote-host 127.0.0.1 --remote-port 8500 \
++  --video-mode none --headless --device cuda:0 \
++  --output-folder-name droid_collection \
++  --trajectory-config examples/configs/droid_lerobot_trajectory.yaml
++```
++
++`--video-mode none` disables the human-viewable evaluation video; it does not
++disable the three training camera streams. Do not add `--record-image-data`
++unless full-resolution images are also required in the HDF5 sidecar. The
++LeRobot recorder already captures its own bounded `640x360` streams.
++
++Write the live output to node-local NVMe. Move completed datasets to shared
++storage only after validation.
++
++## Output
++
++With the default `output_root: null`, output is placed under the evaluation
++directory:
++
++```text
++droid_plus_lerobot_640x360_20260412/
++|-- success/                         # LeRobot v3 training dataset
++|   |-- data/                        # aligned state/action Parquet rows
++|   |-- videos/                      # three H.264 streams
++|   `-- meta/                        # info, stats, tasks, episodes
++|-- sidecars/
++|   |-- env_configs/
++|   |-- success/                     # JSON + per-episode HDF5
++|   `-- failure/                     # JSON metadata only when unavailable
++`-- manifest.json
++```
++
++An interrupted batch publishes no partial successful episode. Failed episode
++videos are discarded. `keep_failure_sidecars` controls whether lightweight
++failure metadata is retained.
++
++## Validate
++
++Validate every completed shard before training or transfer:
++
++```bash
++robolab-validate-droid-trajectory \
++  output/droid_collection/droid_plus_lerobot_640x360_20260412
++```
++
++The validator checks the LeRobot schema, continuous frame/global indexes,
++timestamps, video frame counts, successful-only metadata, required sidecars,
++and exact action agreement with HDF5. From a Cosmos environment, also exercise
++the actual training loader:
++
++```bash
++robolab-validate-droid-trajectory DATASET --check-cosmos-loader
++```
++
++## Throughput And Memory
++
++The recorder resizes all three camera batches on the simulator GPU, performs
++one CPU transfer per vector step, and feeds bounded asynchronous H.264 writers.
++No image history remains on the simulator GPU. A four-frame queue per camera
++was selected because a 16-frame queue did not improve throughput and increased
++host memory. Image statistics sample every fourth temporal frame by default;
++all RGB frames are still encoded. On the 1,421-frame validation dataset, this
++changed per-channel means by at most `0.00011`, standard deviations by at most
++`0.00006`, and quantiles by at most one 8-bit value.
++
++The fixed-window A/B below used one RTX 4090 simulator, 10 active environments
++for exactly 128 vector steps, a separate RTX 4090 Edge GenW8A8 server, and no
++evaluation video. Every row used the same initial state and policy setup.
++
++| Training trajectory | Stats frame stride | Wall time | Vector steps/s | Recorder time |
++| --- | ---: | ---: | ---: | ---: |
++| Disabled | - | 108.20 s | 1.18 | - |
++| Enabled | 1 | 125.04 s | 1.02 | 8.33 s |
++| Enabled (default) | 4 | 120.14 s | 1.07 | 7.71 s |
++
++The default recorder added `11.0%` wall time for three compressed training
++streams, down from `15.5%` with full-frame statistics. Temporal subsampling
++affects LeRobot image statistics only; every RGB frame remains in the videos.
++CPU load, local-disk bandwidth, scene complexity, active environment count,
++and trajectory length can change the result. Run the fixed-window A/B on the
++target collection host before scaling to several lanes.
++
++Leave CPU scheduling to the operating system for a single simulator process.
++When several simulator processes share a host, assign each process a wide,
++disjoint CPU/NUMA set and benchmark the complete lane. Narrow process affinity
++also constrains its FFmpeg children and can slow both simulation and encoding.
++
++A complete Banana-on-plate run produced 9 successful episodes, 1,421 aligned
++frames, and 27 videos in 37 MB at `crf: 23`. H.264 size varies with visual
++complexity and episode length, so size the target task before a large run.
+diff --git a/docs/data.md b/docs/data.md
+index 1145cb6..5e327ab 100644
+--- a/docs/data.md
++++ b/docs/data.md
+@@ -27,6 +27,11 @@ memory is fixed.
+ 
+ Recorded episodes can be played back — see [Replaying Recorded Episodes](replay.md).
+ 
++To save successful Cosmos3 rollouts directly in the LeRobot v3 schema consumed
++by Cosmos-DROID joint-position training, see
++[Cosmos-DROID Training Trajectories](cosmos_droid_trajectories.md). This is a
++separate bounded H.264 path; HDF5 remains a rich reproduction sidecar.
++
+ Validate a completed multi-env file before moving it into a training dataset:
+ 
+ ```bash
+diff --git a/examples/configs/droid_lerobot_trajectory.yaml b/examples/configs/droid_lerobot_trajectory.yaml
+new file mode 100644
+index 0000000..3788708
+--- /dev/null
++++ b/examples/configs/droid_lerobot_trajectory.yaml
+@@ -0,0 +1,26 @@
++# Training-ready Cosmos-DROID joint-position preset. Its 640x360, 15 FPS,
++# three-camera schema is fixed for compatibility with the current Cosmos
++# loader. Custom recorders can use robolab.core.logging.lerobot_trajectory.
++# output_root defaults to
++# <evaluation output>/droid_plus_lerobot_640x360_20260412 when null. Keeping
++# that basename lets Cosmos' DROID loader recognize the dataset directly.
++output_root: null
++repo_id: local/robolab-droid-joint-position
++# Set this to the exact Hugging Face model ID or local checkpoint digest used.
++checkpoint: XXXXyu/Cosmos3-Edge-Policy-DROID-GenW8A8
++fps: 15
++image_width: 640
++image_height: 360
++codec: h264
++crf: 23
++preset: ultrafast
++encoder_threads_per_camera: 1
++# Four frames per camera is enough to hide encoder jitter without adding the
++# roughly 450 MiB host-memory cost measured with a 16-frame queue at 10 envs.
++encoder_queue_frames: 4
++# Statistics sample every fourth frame; all video frames are still saved.
++image_stats_frame_stride: 4
++sidecar_level: full
++keep_failure_sidecars: true
++keep_staging: false
++overwrite: false
+diff --git a/pyproject.toml b/pyproject.toml
+index 56f5ad9..6670517 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -61,11 +61,19 @@ isaac51 = [
+     "isaacsim[all,extscache]==5.1.0",
+ ]
+ analysis = ["sbi"]
++trajectory = [
++    "accelerate>=1,<2",
++    "lerobot @ git+https://github.com/mli0603/lerobot.git@1a4316c6845330bc552fb982dbc44bdb4f66f2f1",
++    "av>=15,<16",
++    "datasets>=4,<5",
++    "pyarrow>=20,<24",
++]
+ test = ["pytest"]
+ all = ["sbi", "pytest"]
+ 
+ [project.scripts]
+ robolab-dashboard = "dashboard.cli:main"
++robolab-validate-droid-trajectory = "robolab.tools.validate_droid_trajectory:main"
+ 
+ [build-system]
+ requires = ["setuptools>=61.0"]
+@@ -91,7 +99,12 @@ conflicts = [[{ extra = "isaac50" }, { extra = "isaac51" }]]
+ # which headless eval never touches, and the benchmark runs routinely on
+ # isaac50 with websockets 16. Override the pin so the lock resolves a modern
+ # websockets for the policy clients instead of being dragged down to 12.0.
+-override-dependencies = ["websockets>=14.0"]
++override-dependencies = [
++    "websockets>=14.0",
++    # Isaac Sim 5.1 requires packaging==23.0. The pinned LeRobot fork's
++    # runtime dataset APIs work with 23.0 despite its overly strict metadata.
++    "packaging==23.0",
++]
+ # warp-lang 1.13.0.dev20260418 on pypi.nvidia.com only published the macOS
+ # wheel — no Linux build — so any resolver pass that picked it would break
+ # `uv sync` on Linux. Exclude that specific version.
+diff --git a/robolab/core/logging/droid_lerobot_trajectory.py b/robolab/core/logging/droid_lerobot_trajectory.py
+new file mode 100644
+index 0000000..ba66e2a
+--- /dev/null
++++ b/robolab/core/logging/droid_lerobot_trajectory.py
+@@ -0,0 +1,534 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""Success-only DROID joint-position trajectory recording in LeRobot v3 format."""
++
++from __future__ import annotations
++
++import json
++import logging
++import shutil
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++import torch
++import yaml
++from scipy.spatial.transform import Rotation
++
++from robolab.core.logging.lerobot_trajectory import (
++    LeRobotVideoEpisode,
++    VideoEncodingConfig,
++    VideoStreamConfig,
++    resize_rgb_batch,
++    resize_rgb_streams,
++    video_features,
++)
++
++logger = logging.getLogger(__name__)
++
++FPS = 15
++IMAGE_HEIGHT = 360
++IMAGE_WIDTH = 640
++COSMOS_DROID_DATASET_VERSION = "droid_plus_lerobot_640x360_20260412"
++
++IMAGE_FEATURES = {
++    "observation.image.exterior_image_1_left": "over_shoulder_left_camera",
++    "observation.image.exterior_image_2_left": "over_shoulder_right_camera",
++    "observation.image.wrist_image_left": "wrist_cam",
++}
++DROID_VIDEO_STREAMS = tuple(
++    VideoStreamConfig(feature, camera, IMAGE_WIDTH, IMAGE_HEIGHT)
++    for feature, camera in IMAGE_FEATURES.items()
++)
++
++
++def droid_features() -> dict[str, dict[str, Any]]:
++    """Feature schema consumed by Cosmos' 640x360 DROID LeRobot loader."""
++    return {
++        **video_features(DROID_VIDEO_STREAMS),
++        "observation.state.joint_positions": {
++            "dtype": "float32",
++            "shape": (7,),
++            "names": [f"joint_{i}" for i in range(7)],
++        },
++        "observation.state.gripper_position": {
++            "dtype": "float32",
++            "shape": (1,),
++            "names": ["gripper"],
++        },
++        "observation.state.cartesian_position": {
++            "dtype": "float32",
++            "shape": (6,),
++            "names": ["x", "y", "z", "roll", "pitch", "yaw"],
++        },
++        "action.joint_position": {
++            "dtype": "float32",
++            "shape": (7,),
++            "names": [f"joint_{i}" for i in range(7)],
++        },
++        "action.gripper_position": {
++            "dtype": "float32",
++            "shape": (1,),
++            "names": ["gripper"],
++        },
++    }
++
++
++@dataclass(frozen=True)
++class DroidTrajectoryConfig:
++    output_root: str | None = None
++    repo_id: str = "local/robolab-droid-joint-position"
++    checkpoint: str = "unknown"
++    fps: int = FPS
++    image_width: int = IMAGE_WIDTH
++    image_height: int = IMAGE_HEIGHT
++    codec: str = "h264"
++    crf: int = 23
++    preset: str = "ultrafast"
++    encoder_threads_per_camera: int = 1
++    encoder_queue_frames: int = 4
++    image_stats_frame_stride: int = 4
++    sidecar_level: str = "full"
++    keep_failure_sidecars: bool = True
++    keep_staging: bool = False
++    overwrite: bool = False
++
++    @classmethod
++    def from_yaml(cls, path: str | Path) -> "DroidTrajectoryConfig":
++        with Path(path).open() as stream:
++            raw = yaml.safe_load(stream) or {}
++        unknown = set(raw) - set(cls.__dataclass_fields__)
++        if unknown:
++            raise ValueError(f"Unknown trajectory config keys: {sorted(unknown)}")
++        cfg = cls(**raw)
++        cfg.validate()
++        return cfg
++
++    def validate(self) -> None:
++        if self.checkpoint in {"", "unknown", "replace-with-model-id-or-checkpoint-digest"}:
++            raise ValueError("checkpoint must identify the policy weights used for rollout")
++        if self.fps != FPS:
++            raise ValueError(f"Cosmos DROID trajectories require fps={FPS}, got {self.fps}")
++        if (self.image_width, self.image_height) != (IMAGE_WIDTH, IMAGE_HEIGHT):
++            raise ValueError(
++                "Cosmos DROID trajectories require 640x360 RGB, got "
++                f"{self.image_width}x{self.image_height}"
++            )
++        if self.codec != "h264":
++            raise ValueError("Cosmos DROID trajectory recording currently supports codec='h264' only")
++        if self.encoder_queue_frames < 1:
++            raise ValueError("encoder_queue_frames must be positive")
++        if self.image_stats_frame_stride < 1:
++            raise ValueError("image_stats_frame_stride must be positive")
++        if self.sidecar_level not in {"minimal", "full"}:
++            raise ValueError("sidecar_level must be 'minimal' or 'full'")
++
++    def video_encoding(self) -> VideoEncodingConfig:
++        """Build the generic encoder config used by the DROID preset."""
++        return VideoEncodingConfig(
++            fps=self.fps,
++            codec=self.codec,
++            crf=self.crf,
++            preset=self.preset,
++            threads_per_stream=self.encoder_threads_per_camera,
++            queue_frames=self.encoder_queue_frames,
++            image_stats_frame_stride=self.image_stats_frame_stride,
++        )
++
++
++def _resize_rgb_batch(images: torch.Tensor, env_ids: list[int]) -> np.ndarray:
++    """Resize an RGB batch to the Cosmos-DROID training resolution."""
++    return resize_rgb_batch(images, env_ids, width=IMAGE_WIDTH, height=IMAGE_HEIGHT)
++
++
++def _resize_rgb_streams(image_obs: dict[str, torch.Tensor], env_ids: list[int]) -> dict[str, np.ndarray]:
++    """Resize all Cosmos-DROID streams using the generic batched path."""
++    return resize_rgb_streams(image_obs, env_ids, DROID_VIDEO_STREAMS)
++
++
++def _official_droid_gripper(robolab_value: np.ndarray | float) -> np.ndarray:
++    """Convert RoboLab (0=open, 1=closed) to raw DROID (1=open, 0=closed)."""
++    value = np.asarray(robolab_value, dtype=np.float32).reshape(1)
++    return 1.0 - np.clip(value, 0.0, 1.0)
++
++
++def _cartesian_position(position: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
++    quat_xyzw = np.asarray(quat_wxyz, dtype=np.float32)[[1, 2, 3, 0]]
++    euler_xyz = Rotation.from_quat(quat_xyzw).as_euler("xyz").astype(np.float32)
++    return np.concatenate((np.asarray(position, dtype=np.float32), euler_xyz)).astype(np.float32)
++
++
++def build_droid_frame(
++    *,
++    images: dict[str, np.ndarray],
++    joint_positions: np.ndarray,
++    gripper_position: np.ndarray,
++    ee_position: np.ndarray,
++    ee_quaternion_wxyz: np.ndarray,
++    executed_action: np.ndarray,
++    task: str,
++) -> dict[str, Any]:
++    """Build one aligned ``observation[t] -> executed_action[t]`` training row."""
++    action = np.asarray(executed_action, dtype=np.float32)
++    if action.shape != (8,):
++        raise ValueError(f"Expected 8D joint-position action, got {action.shape}")
++    return {
++        **images,
++        "observation.state.joint_positions": np.asarray(joint_positions, dtype=np.float32),
++        "observation.state.gripper_position": _official_droid_gripper(gripper_position),
++        "observation.state.cartesian_position": _cartesian_position(ee_position, ee_quaternion_wxyz),
++        "action.joint_position": action[:7],
++        "action.gripper_position": _official_droid_gripper(float(action[7] > 0.5)),
++        "task": task,
++    }
++
++
++def _jsonable(value: Any) -> Any:
++    if isinstance(value, torch.Tensor):
++        return value.detach().cpu().tolist()
++    if isinstance(value, np.ndarray):
++        return value.tolist()
++    if isinstance(value, np.generic):
++        return value.item()
++    if isinstance(value, dict):
++        return {str(key): _jsonable(item) for key, item in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_jsonable(item) for item in value]
++    if isinstance(value, (str, int, float, bool)) or value is None:
++        return value
++    return str(value)
++
++
++def _slice_env(value: Any, env_id: int, num_envs: int) -> Any:
++    if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == num_envs:
++        return value[env_id]
++    if isinstance(value, np.ndarray) and value.ndim > 0 and value.shape[0] == num_envs:
++        return value[env_id]
++    if isinstance(value, dict):
++        return {key: _slice_env(item, env_id, num_envs) for key, item in value.items()}
++    return value
++
++
++@dataclass
++class _Slot:
++    env_id: int
++    dataset: Any
++    source_root: Path
++    successful_episodes: list[dict[str, Any]] = field(default_factory=list)
++    initial_state: dict[str, Any] | None = None
++    camera_extrinsics: dict[str, Any] | None = None
++    frame_count: int = 0
++    recording_s: float = 0.0
++    run_context: dict[str, Any] = field(default_factory=dict)
++    video_episode: LeRobotVideoEpisode | None = None
++
++
++class DroidLeRobotTrajectoryRecorder:
++    """Collect parallel RoboLab episodes and publish successes as one v3 dataset."""
++
++    def __init__(self, config: DroidTrajectoryConfig, experiment_output: str | Path):
++        config.validate()
++        self.config = config
++        self.output_root = Path(
++            config.output_root or Path(experiment_output) / COSMOS_DROID_DATASET_VERSION
++        )
++        self.success_root = self.output_root / "success"
++        self.staging_root = self.output_root / ".staging"
++        if self.output_root.exists():
++            if not config.overwrite:
++                raise FileExistsError(f"Trajectory output already exists: {self.output_root}")
++            shutil.rmtree(self.output_root)
++        self.staging_root.mkdir(parents=True)
++        self._slots: dict[int, _Slot] = {}
++        self._batch_active = False
++        self._recording_s = 0.0
++        self._commit_s = 0.0
++        self._env_config_paths: dict[str, str] = {}
++
++    def _new_slot(self, env_id: int) -> _Slot:
++        from lerobot.datasets.lerobot_dataset import LeRobotDataset
++
++        source_root = self.staging_root / f"env-{env_id:03d}"
++        dataset = LeRobotDataset.create(
++            repo_id=f"{self.config.repo_id}-env-{env_id:03d}",
++            root=source_root,
++            fps=self.config.fps,
++            robot_type="droid",
++            features=droid_features(),
++            use_videos=True,
++            vcodec=self.config.codec,
++        )
++        dataset.meta.update_chunk_settings(video_files_size_in_mb=1)
++        return _Slot(env_id=env_id, dataset=dataset, source_root=source_root)
++
++    def _start_streams(self, slot: _Slot) -> None:
++        slot.video_episode = LeRobotVideoEpisode(
++            dataset=slot.dataset,
++            source_root=slot.source_root,
++            streams=DROID_VIDEO_STREAMS,
++            encoding=self.config.video_encoding(),
++        )
++        slot.video_episode.start()
++
++    @staticmethod
++    def _close_streams(slot: _Slot) -> None:
++        if slot.video_episode is not None:
++            slot.video_episode.close()
++
++    @staticmethod
++    def _discard_streams(slot: _Slot) -> None:
++        if slot.video_episode is not None:
++            slot.video_episode.discard()
++            slot.video_episode = None
++
++    @staticmethod
++    def _add_streamed_frame(slot: _Slot, frame: dict[str, Any]) -> None:
++        if slot.video_episode is None:
++            raise RuntimeError("Episode video streams are not active")
++        slot.video_episode.add_frame(frame)
++
++    @staticmethod
++    def _save_streamed_episode(slot: _Slot) -> None:
++        if slot.video_episode is None:
++            raise RuntimeError("Episode video streams are not active")
++        slot.video_episode.save()
++        slot.video_episode = None
++
++    def begin_batch(self, env, env_cfg, *, task_name: str, run_index: int, policy: str) -> None:
++        if self._batch_active:
++            raise RuntimeError("A trajectory batch is already active")
++        self._batch_active = True
++        env_cfg_dir = self.output_root / "sidecars" / "env_configs"
++        env_cfg_dir.mkdir(parents=True, exist_ok=True)
++        env_cfg_path = env_cfg_dir / f"{task_name}.json"
++        if not env_cfg_path.exists():
++            env_cfg_path.write_text(json.dumps(_jsonable(env_cfg.to_dict()), indent=2) + "\n")
++        self._env_config_paths[task_name] = str(env_cfg_path.relative_to(self.output_root))
++
++        scene_state = env.scene.get_state(is_relative=True)
++        camera_extrinsics = self._camera_extrinsics(env)
++        for env_id in range(env.num_envs):
++            if env_id not in self._slots:
++                self._slots[env_id] = self._new_slot(env_id)
++            slot = self._slots[env_id]
++            if slot.frame_count:
++                raise RuntimeError(f"env {env_id} has an unfinished trajectory")
++            slot.initial_state = _jsonable(_slice_env(scene_state, env_id, env.num_envs))
++            slot.camera_extrinsics = _jsonable(_slice_env(camera_extrinsics, env_id, env.num_envs))
++            slot.run_context = {
++                "task": task_name,
++                "language_instruction": env_cfg.instruction,
++                "run_index": run_index,
++                "env_id": env_id,
++                "policy": policy,
++                "checkpoint": self.config.checkpoint,
++                "seed": int(env_cfg.seed) if env_cfg.seed is not None else None,
++                "env_config": self._env_config_paths[task_name],
++                "robolab_hdf5": str(Path(env.output_dir) / f"run_{run_index}.hdf5"),
++            }
++
++    @staticmethod
++    def _camera_extrinsics(env) -> dict[str, dict[str, torch.Tensor]]:
++        result = {}
++        origins = env.scene.env_origins[:, :3]
++        for camera_name in IMAGE_FEATURES.values():
++            camera = env.scene.sensors[camera_name]
++            result[camera_name] = {
++                "position_env": camera.data.pos_w - origins,
++                "quaternion_xyzw_ros": camera.data.quat_w_ros,
++            }
++        return result
++
++    def record_step(self, obs: dict, actions: torch.Tensor, active_env_ids: list[int]) -> None:
++        if not active_env_ids:
++            return
++        started = time.perf_counter()
++        image_batches = _resize_rgb_streams(obs["image_obs"], active_env_ids)
++        proprio = obs["proprio_obs"]
++        joint = proprio["arm_joint_pos"][active_env_ids].detach().cpu().numpy()
++        gripper = proprio["gripper_pos"][active_env_ids].detach().cpu().numpy()
++        ee_position = proprio["ee_pos"][active_env_ids].detach().cpu().numpy()
++        ee_quaternion = proprio["ee_quat"][active_env_ids].detach().cpu().numpy()
++        executed = actions[active_env_ids].detach().cpu().numpy()
++        shared_s = (time.perf_counter() - started) / len(active_env_ids)
++
++        for row, env_id in enumerate(active_env_ids):
++            env_started = time.perf_counter()
++            slot = self._slots[env_id]
++            if slot.video_episode is None:
++                self._start_streams(slot)
++            frame = build_droid_frame(
++                images={feature: batch[row] for feature, batch in image_batches.items()},
++                joint_positions=joint[row],
++                gripper_position=gripper[row],
++                ee_position=ee_position[row],
++                ee_quaternion_wxyz=ee_quaternion[row],
++                executed_action=executed[row],
++                task=slot.run_context["language_instruction"],
++            )
++            self._add_streamed_frame(slot, frame)
++            slot.frame_count += 1
++            slot.recording_s += shared_s + time.perf_counter() - env_started
++        self._recording_s += time.perf_counter() - started
++
++    def end_batch(self, env_results: list[dict], timing: dict, final_infos: list[dict] | None = None) -> None:
++        if not self._batch_active:
++            raise RuntimeError("No active trajectory batch")
++        result_by_env = {item["env_id"]: item for item in env_results}
++        final_infos = final_infos or []
++        for env_id, slot in self._slots.items():
++            result = result_by_env[env_id]
++            success = bool(result.get("success"))
++            final_info = final_infos[env_id] if env_id < len(final_infos) else {}
++            reason = (final_info or {}).get("info")
++            metadata = {
++                **slot.run_context,
++                "success": success,
++                "episode_length": slot.frame_count,
++                "termination_reason": "success" if success else reason or "time_limit_or_failure",
++                "rollout_timing": timing,
++                "recording_timing": {
++                    "record_step_attributed_s": round(slot.recording_s, 6),
++                },
++                "initial_state": slot.initial_state,
++                "camera_extrinsics": slot.camera_extrinsics,
++            }
++            if success:
++                commit_started = time.perf_counter()
++                self._close_streams(slot)
++                self._save_streamed_episode(slot)
++                episode_commit_s = time.perf_counter() - commit_started
++                metadata["recording_timing"]["lerobot_commit_s"] = round(episode_commit_s, 6)
++                local_episode = slot.dataset.meta.total_episodes - 1
++                sidecar_rel = self._write_sidecar(slot, metadata, local_episode, success=True)
++                slot.successful_episodes.append({**metadata, "sidecar_path": sidecar_rel})
++                self._commit_s += episode_commit_s
++            else:
++                self._discard_streams(slot)
++                slot.dataset.clear_episode_buffer(delete_images=False)
++                if self.config.keep_failure_sidecars:
++                    self._write_sidecar(slot, metadata, slot.run_context["run_index"], success=False)
++            slot.frame_count = 0
++            slot.recording_s = 0.0
++            slot.initial_state = None
++            slot.camera_extrinsics = None
++            slot.run_context = {}
++        self._batch_active = False
++
++    def abort_batch(self) -> None:
++        """Discard an interrupted batch without publishing partial episodes."""
++        for slot in self._slots.values():
++            self._discard_streams(slot)
++            slot.dataset.clear_episode_buffer(delete_images=False)
++            slot.frame_count = 0
++            slot.recording_s = 0.0
++            slot.initial_state = None
++            slot.camera_extrinsics = None
++            slot.run_context = {}
++        self._batch_active = False
++
++    def _write_sidecar(self, slot: _Slot, metadata: dict, index: int, *, success: bool) -> str:
++        category = "success" if success else "failure"
++        directory = self.output_root / "sidecars" / category / f"env-{slot.env_id:03d}"
++        directory.mkdir(parents=True, exist_ok=True)
++        stem = f"episode-{index:06d}"
++        if self.config.sidecar_level == "full":
++            source_path = Path(metadata["robolab_hdf5"])
++            if not source_path.exists() and success:
++                raise FileNotFoundError(f"RoboLab sidecar source is missing: {source_path}")
++            import h5py
++
++            source_key = f"data/demo_{slot.env_id}"
++            source_has_episode = False
++            if source_path.exists():
++                with h5py.File(source_path, "r") as source:
++                    source_has_episode = source_key in source
++                    if source_has_episode:
++                        hdf5_path = directory / f"{stem}.hdf5"
++                        with h5py.File(hdf5_path, "w") as target:
++                            data_group = target.create_group("data")
++                            source.copy(source_key, data_group, name="demo_0")
++                            data_group.attrs["source_env_id"] = slot.env_id
++                        metadata["trajectory_sidecar"] = str(hdf5_path.relative_to(self.output_root))
++            if not source_has_episode:
++                if success:
++                    raise RuntimeError(f"RoboLab sidecar source has no {source_key}: {source_path}")
++                metadata["trajectory_sidecar_unavailable"] = "episode_not_exported"
++        metadata.pop("robolab_hdf5", None)
++        json_path = directory / f"{stem}.json"
++        json_path.write_text(json.dumps(_jsonable(metadata), indent=2) + "\n")
++        return str(json_path.relative_to(self.output_root))
++
++    def finalize(self) -> Path | None:
++        if self._batch_active:
++            raise RuntimeError("Cannot finalize with an active trajectory batch")
++        sources = []
++        records = []
++        for env_id in sorted(self._slots):
++            slot = self._slots[env_id]
++            slot.dataset.finalize()
++            if slot.successful_episodes:
++                sources.append(slot)
++                records.extend(slot.successful_episodes)
++        if not sources:
++            logger.warning("No successful episodes were recorded; no success dataset was created")
++            return None
++
++        for episode_index, record in enumerate(records):
++            record["episode_index"] = episode_index
++            sidecar_path = self.output_root / record["sidecar_path"]
++            sidecar = json.loads(sidecar_path.read_text())
++            sidecar["episode_index"] = episode_index
++            sidecar_path.write_text(json.dumps(sidecar, indent=2) + "\n")
++
++        from lerobot.datasets.aggregate import aggregate_datasets
++
++        aggregate_datasets(
++            repo_ids=[slot.dataset.repo_id for slot in sources],
++            roots=[slot.source_root for slot in sources],
++            aggr_repo_id=self.config.repo_id,
++            aggr_root=self.success_root,
++            video_files_size_in_mb=1,
++        )
++        self._attach_episode_metadata(records)
++        manifest = {
++            "schema": "cosmos-droid-joint-position-lerobot-v3",
++            "repo_id": self.config.repo_id,
++            "successful_episodes": len(records),
++            "failed_episodes": sum(
++                len(list(path.glob("*.json")))
++                for path in (self.output_root / "sidecars" / "failure").glob("env-*")
++            ) if (self.output_root / "sidecars" / "failure").exists() else 0,
++            "recording_pre_step_s": round(self._recording_s, 6),
++            "episode_commit_s": round(self._commit_s, 6),
++            "config": _jsonable(self.config.__dict__),
++        }
++        (self.output_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
++        if not self.config.keep_staging:
++            shutil.rmtree(self.staging_root)
++        return self.success_root
++
++    def _attach_episode_metadata(self, records: list[dict[str, Any]]) -> None:
++        import pandas as pd
++
++        episode_files = sorted((self.success_root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
++        offset = 0
++        for path in episode_files:
++            frame = pd.read_parquet(path)
++            subset = records[offset : offset + len(frame)]
++            if len(subset) != len(frame):
++                raise RuntimeError("LeRobot aggregate episode order does not match recorder metadata")
++            frame["success"] = True
++            frame["seed"] = [item["seed"] for item in subset]
++            frame["run_index"] = [item["run_index"] for item in subset]
++            frame["env_id"] = [item["env_id"] for item in subset]
++            frame["termination_reason"] = [item["termination_reason"] for item in subset]
++            frame["checkpoint"] = [item["checkpoint"] for item in subset]
++            frame["sidecar_path"] = [item["sidecar_path"] for item in subset]
++            frame.to_parquet(path, index=False)
++            offset += len(frame)
++        if offset != len(records):
++            raise RuntimeError(f"Expected {len(records)} episode rows, found {offset}")
+diff --git a/robolab/core/logging/lerobot_trajectory.py b/robolab/core/logging/lerobot_trajectory.py
+new file mode 100644
+index 0000000..6ae0f9e
+--- /dev/null
++++ b/robolab/core/logging/lerobot_trajectory.py
+@@ -0,0 +1,339 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""Reusable streaming video support for LeRobot trajectory recorders."""
++
++from __future__ import annotations
++
++import shutil
++import tempfile
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++
++
++@dataclass(frozen=True)
++class VideoStreamConfig:
++    """Map one simulator RGB observation to one LeRobot video feature."""
++
++    feature_key: str
++    observation_key: str
++    width: int
++    height: int
++
++    def validate(self) -> None:
++        if not self.feature_key or not self.observation_key:
++            raise ValueError("Video stream keys must be non-empty")
++        if self.width < 2 or self.height < 2:
++            raise ValueError("Video stream width and height must be at least 2")
++
++
++@dataclass(frozen=True)
++class VideoEncodingConfig:
++    """Encoding controls shared by all streams in a trajectory recorder."""
++
++    fps: int
++    codec: str = "h264"
++    pixel_format: str = "yuv420p"
++    crf: int = 23
++    preset: str = "ultrafast"
++    threads_per_stream: int = 1
++    queue_frames: int = 4
++    ffmpeg_params: tuple[str, ...] = ()
++    image_stats_pixel_stride: int = 4
++    image_stats_frame_stride: int = 1
++
++    def validate(self) -> None:
++        if self.fps < 1:
++            raise ValueError("fps must be positive")
++        if self.queue_frames < 1:
++            raise ValueError("queue_frames must be positive")
++        if self.threads_per_stream < 1:
++            raise ValueError("threads_per_stream must be positive")
++        if self.image_stats_pixel_stride < 1:
++            raise ValueError("image_stats_pixel_stride must be positive")
++        if self.image_stats_frame_stride < 1:
++            raise ValueError("image_stats_frame_stride must be positive")
++
++
++def video_features(streams: tuple[VideoStreamConfig, ...]) -> dict[str, dict[str, Any]]:
++    """Build LeRobot feature entries for configurable RGB video streams."""
++    result = {}
++    for stream in streams:
++        stream.validate()
++        if stream.feature_key in result:
++            raise ValueError(f"Duplicate video feature: {stream.feature_key}")
++        result[stream.feature_key] = {
++            "dtype": "video",
++            "shape": (stream.height, stream.width, 3),
++            "names": ["height", "width", "channels"],
++        }
++    return result
++
++
++def resize_rgb_batch(
++    images: torch.Tensor,
++    env_ids: list[int],
++    *,
++    width: int,
++    height: int,
++) -> np.ndarray:
++    """Resize an NHWC uint8 batch before one contiguous CPU transfer."""
++    selected = images[env_ids].detach().permute(0, 3, 1, 2)
++    if selected.shape[-2:] != (height, width):
++        selected = F.interpolate(
++            selected.to(torch.float16 if selected.is_cuda else torch.float32),
++            size=(height, width),
++            mode="bilinear",
++            align_corners=False,
++            antialias=True,
++        ).round_().clamp_(0, 255).to(torch.uint8)
++    return selected.permute(0, 2, 3, 1).contiguous().cpu().numpy()
++
++
++def resize_rgb_streams(
++    image_obs: dict[str, torch.Tensor],
++    env_ids: list[int],
++    streams: tuple[VideoStreamConfig, ...],
++) -> dict[str, np.ndarray]:
++    """Resize stream groups with compatible shapes in batched GPU operations."""
++    if not streams:
++        return {}
++    groups: dict[tuple[Any, ...], list[VideoStreamConfig]] = {}
++    for stream in streams:
++        stream.validate()
++        images = image_obs[stream.observation_key]
++        if images.ndim != 4 or images.shape[-1] != 3:
++            raise ValueError(
++                f"Expected NHWC RGB observation for {stream.observation_key}, got {tuple(images.shape)}"
++            )
++        group_key = (
++            stream.height,
++            stream.width,
++            tuple(images.shape[1:]),
++            images.device,
++            images.dtype,
++        )
++        groups.setdefault(group_key, []).append(stream)
++
++    result = {}
++    for group in groups.values():
++        first = group[0]
++        selected = torch.stack(
++            [image_obs[stream.observation_key][env_ids] for stream in group]
++        )
++        stream_count, env_count, _, _, channels = selected.shape
++        selected = selected.permute(0, 1, 4, 2, 3).flatten(0, 1)
++        if selected.shape[-2:] != (first.height, first.width):
++            selected = F.interpolate(
++                selected.to(torch.float16 if selected.is_cuda else torch.float32),
++                size=(first.height, first.width),
++                mode="bilinear",
++                align_corners=False,
++                antialias=True,
++            ).round_().clamp_(0, 255).to(torch.uint8)
++        host = (
++            selected.reshape(stream_count, env_count, channels, first.height, first.width)
++            .permute(0, 1, 3, 4, 2)
++            .contiguous()
++            .cpu()
++            .numpy()
++        )
++        result.update({stream.feature_key: host[index] for index, stream in enumerate(group)})
++    return result
++
++
++class _ImageStats:
++    """Constant-memory RGB statistics compatible with LeRobot metadata."""
++
++    def __init__(self, pixel_stride: int, frame_stride: int) -> None:
++        self.pixel_stride = pixel_stride
++        self.frame_stride = frame_stride
++        self.frames_seen = 0
++        self.frames = 0
++        self.pixels = 0
++        self.sum = np.zeros(3, dtype=np.float64)
++        self.sum_squares = np.zeros(3, dtype=np.float64)
++        self.minimum = np.full(3, 255, dtype=np.uint8)
++        self.maximum = np.zeros(3, dtype=np.uint8)
++        self.histogram = np.zeros((3, 256), dtype=np.int64)
++
++    def update(self, image: np.ndarray) -> None:
++        frame_index = self.frames_seen
++        self.frames_seen += 1
++        if frame_index % self.frame_stride:
++            return
++        pixels = np.asarray(image, dtype=np.uint8)[:: self.pixel_stride, :: self.pixel_stride].reshape(-1, 3)
++        self.frames += 1
++        self.pixels += len(pixels)
++        self.sum += pixels.sum(axis=0, dtype=np.float64)
++        self.sum_squares += np.square(pixels, dtype=np.float64).sum(axis=0)
++        self.minimum = np.minimum(self.minimum, pixels.min(axis=0))
++        self.maximum = np.maximum(self.maximum, pixels.max(axis=0))
++        for channel in range(3):
++            self.histogram[channel] += np.bincount(pixels[:, channel], minlength=256)
++
++    def result(self) -> dict[str, np.ndarray]:
++        if not self.frames:
++            raise RuntimeError("Cannot compute image statistics without frames")
++        mean = self.sum / self.pixels
++        variance = np.maximum(0.0, self.sum_squares / self.pixels - mean**2)
++        cumulative = self.histogram.cumsum(axis=1)
++        quantiles = {}
++        for value in (0.01, 0.10, 0.50, 0.90, 0.99):
++            target = max(1, int(np.ceil(value * self.pixels)))
++            quantiles[f"q{int(value * 100):02d}"] = np.array(
++                [np.searchsorted(cumulative[channel], target) for channel in range(3)],
++                dtype=np.float64,
++            )
++
++        def normalized(value: np.ndarray) -> np.ndarray:
++            return (value.astype(np.float64) / 255.0).reshape(3, 1, 1)
++
++        return {
++            "min": normalized(self.minimum),
++            "max": normalized(self.maximum),
++            "mean": normalized(mean),
++            "std": normalized(np.sqrt(variance)),
++            "count": np.array([self.frames]),
++            **{key: normalized(value) for key, value in quantiles.items()},
++        }
++
++
++@dataclass
++class LeRobotVideoEpisode:
++    """Stream one episode's video features into a LeRobot dataset buffer."""
++
++    dataset: Any
++    source_root: Path
++    streams: tuple[VideoStreamConfig, ...]
++    encoding: VideoEncodingConfig
++    paths: dict[str, Path] = field(default_factory=dict)
++    writers: dict[str, Any] = field(default_factory=dict)
++    image_stats: dict[str, _ImageStats] = field(default_factory=dict)
++
++    def start(self) -> None:
++        from robolab.core.utils.video_utils import AsyncVideoWriter
++
++        if self.writers:
++            raise RuntimeError("Episode video streams are already active")
++        self.encoding.validate()
++        expected = video_features(self.streams)
++        for feature_key, feature in expected.items():
++            if self.dataset.features.get(feature_key) != feature:
++                raise ValueError(f"LeRobot feature does not match stream config: {feature_key}")
++            episode_index = self.dataset.meta.total_episodes
++            temp_dir = Path(tempfile.mkdtemp(prefix="stream-", dir=self.source_root))
++            path = temp_dir / f"{feature_key}_{episode_index:06d}.mp4"
++            self.paths[feature_key] = path
++            stats = _ImageStats(
++                self.encoding.image_stats_pixel_stride,
++                self.encoding.image_stats_frame_stride,
++            )
++            self.image_stats[feature_key] = stats
++            self.writers[feature_key] = AsyncVideoWriter(
++                str(path),
++                self.encoding.fps,
++                queue_frames=self.encoding.queue_frames,
++                codec="libx264" if self.encoding.codec == "h264" else self.encoding.codec,
++                pixel_format=self.encoding.pixel_format,
++                preset=self.encoding.preset,
++                crf=self.encoding.crf,
++                threads=self.encoding.threads_per_stream,
++                ffmpeg_params=self.encoding.ffmpeg_params,
++                frame_callback=stats.update,
++            )
++
++    def add_frame(self, frame: dict[str, Any]) -> None:
++        from lerobot.datasets.utils import validate_frame
++
++        validate_frame(frame, self.dataset.features)
++        buffer = self.dataset.episode_buffer
++        frame_index = buffer["size"]
++        buffer["frame_index"].append(frame_index)
++        buffer["timestamp"].append(frame_index / self.dataset.fps)
++        buffer["task"].append(frame["task"])
++        for key, value in frame.items():
++            if key == "task":
++                continue
++            if self.dataset.features[key]["dtype"] == "video":
++                self.writers[key].write(value)
++                buffer[key].append(str(self.paths[key]))
++            else:
++                buffer[key].append(value)
++        buffer["size"] += 1
++
++    def close(self) -> None:
++        errors = []
++        for writer in self.writers.values():
++            try:
++                writer.release()
++            except Exception as exc:
++                errors.append(exc)
++        self.writers.clear()
++        if errors:
++            raise RuntimeError(f"Failed to close {len(errors)} trajectory video writer(s)") from errors[0]
++
++    def discard(self) -> None:
++        self.close()
++        for path in self.paths.values():
++            shutil.rmtree(path.parent, ignore_errors=True)
++        self.paths.clear()
++        self.image_stats.clear()
++
++    def save(self) -> None:
++        from lerobot.datasets.compute_stats import compute_episode_stats
++        from lerobot.datasets.utils import validate_episode_buffer
++
++        if self.writers:
++            raise RuntimeError("Close episode video streams before saving")
++        dataset = self.dataset
++        episode_buffer = dataset.episode_buffer
++        validate_episode_buffer(episode_buffer, dataset.meta.total_episodes, dataset.features)
++        episode_length = episode_buffer.pop("size")
++        tasks = episode_buffer.pop("task")
++        episode_tasks = list(set(tasks))
++        episode_index = episode_buffer["episode_index"]
++        episode_buffer["index"] = np.arange(
++            dataset.meta.total_frames, dataset.meta.total_frames + episode_length
++        )
++        episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
++        dataset.meta.save_episode_tasks(episode_tasks)
++        episode_buffer["task_index"] = np.array(
++            [dataset.meta.get_task_index(task) for task in tasks]
++        )
++        for key, feature in dataset.features.items():
++            if key in {"index", "episode_index", "task_index"} or feature["dtype"] == "video":
++                continue
++            episode_buffer[key] = np.stack(episode_buffer[key])
++
++        stats_features = {
++            key: feature for key, feature in dataset.features.items() if feature["dtype"] != "video"
++        }
++        episode_stats = compute_episode_stats(
++            {key: episode_buffer[key] for key in stats_features}, stats_features
++        )
++        episode_stats.update({key: stats.result() for key, stats in self.image_stats.items()})
++        episode_metadata = dataset._save_episode_data(episode_buffer)
++        for video_key in dataset.meta.video_keys:
++            episode_metadata.update(
++                dataset._save_episode_video(
++                    video_key,
++                    episode_index,
++                    temp_path=self.paths[video_key],
++                )
++            )
++        dataset.meta.save_episode(
++            episode_index,
++            episode_length,
++            episode_tasks,
++            episode_stats,
++            episode_metadata,
++        )
++        dataset.clear_episode_buffer(delete_images=False)
++        self.paths.clear()
++        self.image_stats.clear()
+diff --git a/robolab/core/utils/video_utils.py b/robolab/core/utils/video_utils.py
+index 01f5d30..bd155b3 100644
+--- a/robolab/core/utils/video_utils.py
++++ b/robolab/core/utils/video_utils.py
+@@ -3,6 +3,9 @@
+ 
+ import atexit
+ import logging
++import queue
++import threading
++from collections.abc import Callable
+ 
+ import imageio.v2 as imageio
+ import numpy as np
+@@ -18,7 +21,18 @@ class VideoWriter:
+     Memory is bounded by the encoder's lookahead, not by video length.
+     """
+ 
+-    def __init__(self, video_path: str, fps: int):
++    def __init__(
++        self,
++        video_path: str,
++        fps: int,
++        *,
++        codec: str = "libx264",
++        pixel_format: str = "yuv420p",
++        preset: str = "ultrafast",
++        crf: int = 23,
++        threads: int = 1,
++        ffmpeg_params: tuple[str, ...] = (),
++    ):
+         """Initialize video writer.
+ 
+         Args:
+@@ -27,8 +41,15 @@ class VideoWriter:
+         """
+         self.video_path = video_path
+         self.fps = fps
++        self.codec = codec
++        self.pixel_format = pixel_format
++        self.preset = preset
++        self.crf = crf
++        self.threads = threads
++        self.ffmpeg_params = ffmpeg_params
+         self._writer = None
+         atexit.register(self.release)
++        self._atexit_registered = True
+ 
+     def write(self, frame: np.ndarray):
+         if frame is None:
+@@ -41,14 +62,15 @@ class VideoWriter:
+             self._writer = imageio.get_writer(
+                 self.video_path,
+                 fps=self.fps,
+-                codec="libx264",
+-                pixelformat="yuv420p",
++                codec=self.codec,
++                pixelformat=self.pixel_format,
+                 macro_block_size=2,
+                 ffmpeg_params=[
+-                    "-preset", "ultrafast",
+-                    "-threads", "1",
+-                    "-crf", "23",
++                    "-preset", self.preset,
++                    "-threads", str(self.threads),
++                    "-crf", str(self.crf),
+                     "-movflags", "+faststart",
++                    *self.ffmpeg_params,
+                 ],
+             )
+ 
+@@ -61,6 +83,95 @@ class VideoWriter:
+             except Exception:
+                 logger.exception("Failed to close video writer for '%s'", self.video_path)
+             self._writer = None
++        if self._atexit_registered:
++            atexit.unregister(self.release)
++            self._atexit_registered = False
+ 
+     def __del__(self):
+         self.release()
++
++
++class AsyncVideoWriter:
++    """Bounded background wrapper for a streaming :class:`VideoWriter`."""
++
++    _STOP = object()
++
++    def __init__(
++        self,
++        video_path: str,
++        fps: int,
++        *,
++        queue_frames: int = 4,
++        frame_callback: Callable[[np.ndarray], None] | None = None,
++        **writer_kwargs,
++    ):
++        if queue_frames < 1:
++            raise ValueError("queue_frames must be positive")
++        self.video_path = video_path
++        self._writer = VideoWriter(video_path, fps, **writer_kwargs)
++        self._frame_callback = frame_callback
++        self._queue = queue.Queue(maxsize=queue_frames)
++        self._done = threading.Event()
++        self._error: BaseException | None = None
++        self._released = False
++        self._thread = threading.Thread(
++            target=self._run,
++            name=f"video-writer-{id(self):x}",
++            daemon=True,
++        )
++        self._thread.start()
++        atexit.register(self.release)
++        self._atexit_registered = True
++
++    def _run(self) -> None:
++        try:
++            while True:
++                frame = self._queue.get()
++                if frame is self._STOP:
++                    return
++                self._writer.write(frame)
++                if self._frame_callback is not None:
++                    self._frame_callback(frame)
++        except BaseException as exc:
++            self._error = exc
++        finally:
++            self._writer.release()
++            self._done.set()
++
++    def _raise_worker_error(self) -> None:
++        if self._error is not None:
++            raise RuntimeError(f"Background video encoding failed for {self.video_path}") from self._error
++
++    def write(self, frame: np.ndarray) -> None:
++        if self._released:
++            raise RuntimeError(f"Cannot write to released video writer: {self.video_path}")
++        while not self._done.is_set():
++            try:
++                self._queue.put(frame, timeout=0.1)
++                return
++            except queue.Full:
++                continue
++        self._raise_worker_error()
++        raise RuntimeError(f"Background video writer stopped unexpectedly: {self.video_path}")
++
++    def release(self) -> None:
++        if self._released:
++            return
++        self._released = True
++        while not self._done.is_set():
++            try:
++                self._queue.put(self._STOP, timeout=0.1)
++                break
++            except queue.Full:
++                continue
++        self._thread.join()
++        if self._atexit_registered:
++            atexit.unregister(self.release)
++            self._atexit_registered = False
++        self._raise_worker_error()
++
++    def __del__(self):
++        try:
++            self.release()
++        except Exception:
++            logger.exception("Failed to release async video writer for '%s'", self.video_path)
+diff --git a/robolab/eval/episode.py b/robolab/eval/episode.py
+index a398fcd..4b8bb56 100644
+--- a/robolab/eval/episode.py
++++ b/robolab/eval/episode.py
+@@ -19,6 +19,7 @@ import time
+ from collections import defaultdict
+ 
+ import cv2
++import numpy as np
+ import torch
+ from tqdm import tqdm
+ 
+@@ -46,6 +47,8 @@ class TimingStats:
+         for name, times in self.times.items():
+             d[f"{name}_s"] = round(sum(times), 3)
+             d[f"{name}_avg_ms"] = round(sum(times) / len(times) * 1000, 1) if times else 0
++            d[f"{name}_p50_ms"] = round(float(np.median(times)) * 1000, 1) if times else 0
++            d[f"{name}_p95_ms"] = round(float(np.percentile(times, 95)) * 1000, 1) if times else 0
+         d["wall_total_s"] = round(sum(sum(t) for t in self.times.values()), 3)
+         d["it_per_sec"] = round(num_steps / d["wall_total_s"], 2) if d["wall_total_s"] > 0 else 0
+         return d
+@@ -68,6 +71,11 @@ def run_episode(
+     save_videos=True,
+     video_mode="all",
+     enable_gt_state=False,
++    trajectory_recorder=None,
++    task_name: str | None = None,
++    run_index: int | None = None,
++    policy: str | None = None,
++    max_steps_override: int | None = None,
+ ):
+     """Run a policy-controlled episode across all parallel envs.
+ 
+@@ -98,7 +106,7 @@ def run_episode(
+ 
+     obs, _ = env.reset()
+     obs, _ = env.reset()
+-    max_steps = env.max_episode_length
++    max_steps = min(env.max_episode_length, max_steps_override) if max_steps_override else env.max_episode_length
+     video_fps = 1 / (env_cfg.sim.render_interval * env_cfg.sim.dt) # Hz
+     instruction = env_cfg.instruction
+     # Pull action dim from the env's action manager (IsaacLab canonical),
+@@ -113,6 +121,15 @@ def run_episode(
+ 
+     client.begin_episode(episode)
+ 
++    if trajectory_recorder is not None:
++        trajectory_recorder.begin_batch(
++            env,
++            env_cfg,
++            task_name=task_name or getattr(env_cfg, "_task_name", "unknown"),
++            run_index=episode if run_index is None else run_index,
++            policy=policy or "unknown",
++        )
++
+     # Set up per-run HDF5 file and per-env demo indices
+     if env.recorder_manager is not None and hasattr(env.recorder_manager, 'set_hdf5_file'):
+         env.recorder_manager.set_hdf5_file(f"run_{episode}.hdf5")
+@@ -195,6 +212,12 @@ def run_episode(
+             if VISUALIZE:
+                 get_world(env).visualize()
+ 
++            active_before_step = list(env.active_env_ids)
++            if trajectory_recorder is not None:
++                timer.start("trajectory_record")
++                trajectory_recorder.record_step(obs, actions, active_before_step)
++                timer.stop("trajectory_record")
++
+             timer.start("env_step")
+             obs, reward, term, trunc, info = env.step(actions)
+             timer.stop("env_step")
+@@ -222,6 +245,10 @@ def run_episode(
+             # RobolabEnv freezes terminated envs and exports recordings automatically
+             if env.all_terminated:
+                 break
++    except BaseException:
++        if trajectory_recorder is not None:
++            trajectory_recorder.abort_batch()
++        raise
+     finally:
+         for vw in video_writers_obs + video_writers_viewport:
+             try:
+@@ -234,4 +261,8 @@ def run_episode(
+             logger.exception("Failed to reset client after episode")
+ 
+     timing = timer.to_dict(actual_steps)
+-    return env.get_env_results(), subtask_status, timing
++    env_results = env.get_env_results()
++    if trajectory_recorder is not None:
++        final_infos = get_all_env_subtask_infos(env)
++        trajectory_recorder.end_batch(env_results, timing, final_infos)
++    return env_results, subtask_status, timing
+diff --git a/robolab/eval/runner.py b/robolab/eval/runner.py
+index 7eddfe8..746f6e6 100644
+--- a/robolab/eval/runner.py
++++ b/robolab/eval/runner.py
+@@ -58,6 +58,9 @@ def add_common_eval_args(parser: argparse.ArgumentParser) -> None:
+                               "Prefer increasing --num-envs for more episodes. "
+                               "Only increase --num-runs if you run out of GPU memory "
+                               "with the desired num-envs."))
++    parser.add_argument("--max-steps", "--max_steps", type=int, default=None,
++                        help=("Cap each rollout batch at this many vector steps. Intended for "
++                              "smoke tests and throughput benchmarks; task defaults remain unchanged."))
+     parser.add_argument("--num-episodes-adaptive", "--num_episodes_adaptive",
+                         type=int, default=None, metavar="MAX_N",
+                         help=("Enable adaptive sampling per task. Overrides --num-runs. "
+@@ -118,6 +121,9 @@ def add_common_eval_args(parser: argparse.ArgumentParser) -> None:
+     parser.add_argument("--record-storage-profile", choices=("fast", "balanced", "compact"), default=None,
+                         help=("HDF5 image storage: fast is uncompressed and throughput-oriented; "
+                               "balanced uses LZF; compact uses gzip. Image recording defaults to fast."))
++    parser.add_argument("--trajectory-config", type=str, default=None,
++                        help=("YAML config for success-only Cosmos-DROID LeRobot v3 trajectory "
++                              "recording. Requires the 'trajectory' optional dependency."))
+ 
+ 
+ def run_evaluation(
+@@ -168,6 +174,18 @@ def run_evaluation(
+     output_dir = os.path.join(PACKAGE_DIR, "output", output_folder_name)
+     os.makedirs(output_dir, exist_ok=True)
+ 
++    trajectory_recorder = None
++    if args.trajectory_config is not None:
++        from robolab.core.logging.droid_lerobot_trajectory import (
++            DroidLeRobotTrajectoryRecorder,
++            DroidTrajectoryConfig,
++        )
++
++        trajectory_recorder = DroidLeRobotTrajectoryRecorder(
++            DroidTrajectoryConfig.from_yaml(args.trajectory_config),
++            experiment_output=output_dir,
++        )
++
+     if args.task:
+         task_envs = get_envs(task=args.task)
+         filter_str = f"tasks: {', '.join(args.task)}"
+@@ -275,6 +293,11 @@ def run_evaluation(
+                 video_mode=args.video_mode,
+                 headless=args.headless,
+                 enable_gt_state=args.enable_gt_state,
++                trajectory_recorder=trajectory_recorder,
++                task_name=task_env,
++                run_index=run_idx,
++                policy=policy,
++                max_steps_override=args.max_steps,
+             )
+ 
+             episode_results = summarize_run(
+@@ -301,3 +324,6 @@ def run_evaluation(
+         env.close()
+ 
+     summarize_experiment_results(episode_results, show_timing=True)
++    if trajectory_recorder is not None:
++        output = trajectory_recorder.finalize()
++        print(f"[RoboLab] Training trajectories: {output or 'no successful episodes'}")
+diff --git a/robolab/tools/__init__.py b/robolab/tools/__init__.py
+new file mode 100644
+index 0000000..52a7a9d
+--- /dev/null
++++ b/robolab/tools/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
+diff --git a/robolab/tools/validate_droid_trajectory.py b/robolab/tools/validate_droid_trajectory.py
+new file mode 100644
+index 0000000..0532b29
+--- /dev/null
++++ b/robolab/tools/validate_droid_trajectory.py
+@@ -0,0 +1,166 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""Validate a training-ready Cosmos-DROID LeRobot v3 trajectory dataset."""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++import av
++import h5py
++import numpy as np
++import pandas as pd
++
++from robolab.core.logging.droid_lerobot_trajectory import (
++    FPS,
++    IMAGE_FEATURES,
++    IMAGE_HEIGHT,
++    IMAGE_WIDTH,
++    droid_features,
++)
++
++
++def _read_parquet_tree(root: Path) -> pd.DataFrame:
++    files = sorted(root.glob("chunk-*/*.parquet"))
++    if not files:
++        raise ValueError(f"No Parquet files found under {root}")
++    return pd.concat([pd.read_parquet(path) for path in files], ignore_index=True)
++
++
++def _require(condition: bool, message: str) -> None:
++    if not condition:
++        raise ValueError(message)
++
++
++def _video_path(success_root: Path, episode: pd.Series, key: str) -> Path:
++    chunk = int(episode[f"videos/{key}/chunk_index"])
++    file_index = int(episode[f"videos/{key}/file_index"])
++    return success_root / "videos" / key / f"chunk-{chunk:03d}" / f"file-{file_index:03d}.mp4"
++
++
++def validate_dataset(path: str | Path, *, check_cosmos_loader: bool = False) -> dict[str, int]:
++    root = Path(path).resolve()
++    success_root = root if root.name == "success" else root / "success"
++    dataset_root = success_root.parent
++    _require(success_root.is_dir(), f"Missing LeRobot success dataset: {success_root}")
++
++    info = json.loads((success_root / "meta" / "info.json").read_text())
++    _require(info["codebase_version"].startswith("v3"), "Dataset is not LeRobot v3")
++    _require(info["fps"] == FPS, f"Expected {FPS} FPS, got {info['fps']}")
++    expected_features = droid_features()
++    for key, expected in expected_features.items():
++        feature = info["features"].get(key)
++        _require(feature is not None, f"Missing feature: {key}")
++        _require(tuple(feature["shape"]) == tuple(expected["shape"]), f"Wrong shape for {key}")
++        if expected["dtype"] == "video":
++            video = feature.get("info", {})
++            _require(
++                (video.get("video.width"), video.get("video.height"), video.get("video.fps"))
++                == (IMAGE_WIDTH, IMAGE_HEIGHT, FPS),
++                f"Wrong video metadata for {key}",
++            )
++
++    data = _read_parquet_tree(success_root / "data")
++    episodes = _read_parquet_tree(success_root / "meta" / "episodes")
++    _require(len(data) == int(info["total_frames"]), "Frame count disagrees with info.json")
++    _require(len(episodes) == int(info["total_episodes"]), "Episode count disagrees with info.json")
++    ordered = data.sort_values("index")
++    np.testing.assert_array_equal(ordered["index"].to_numpy(), np.arange(len(data)))
++
++    for _, episode in episodes.sort_values("episode_index").iterrows():
++        episode_index = int(episode["episode_index"])
++        length = int(episode["length"])
++        rows = data[data["episode_index"] == episode_index].sort_values("frame_index")
++        _require(len(rows) == length, f"Episode {episode_index}: Parquet length mismatch")
++        np.testing.assert_array_equal(rows["frame_index"].to_numpy(), np.arange(length))
++        np.testing.assert_allclose(rows["timestamp"].to_numpy(), np.arange(length) / FPS, atol=1e-6)
++        _require(bool(episode["success"]), f"Episode {episode_index}: failure entered success dataset")
++        _require(episode["termination_reason"] == "success", f"Episode {episode_index}: invalid termination reason")
++
++        for key in IMAGE_FEATURES:
++            video_path = _video_path(success_root, episode, key)
++            _require(video_path.is_file(), f"Episode {episode_index}: missing {video_path}")
++            with av.open(str(video_path)) as container:
++                frames = sum(1 for _ in container.decode(video=0))
++            _require(frames == length, f"Episode {episode_index}: {key} has {frames}/{length} frames")
++
++        sidecar_path = dataset_root / episode["sidecar_path"]
++        sidecar = json.loads(sidecar_path.read_text())
++        for key in (
++            "task",
++            "language_instruction",
++            "seed",
++            "checkpoint",
++            "episode_length",
++            "termination_reason",
++            "initial_state",
++            "camera_extrinsics",
++            "env_config",
++            "rollout_timing",
++            "recording_timing",
++        ):
++            _require(key in sidecar, f"Episode {episode_index}: sidecar missing {key}")
++        _require(sidecar["checkpoint"] not in {"", "unknown", "replace-with-model-id-or-checkpoint-digest"},
++                 f"Episode {episode_index}: checkpoint provenance is unset")
++        _require(set(IMAGE_FEATURES.values()) <= set(sidecar["camera_extrinsics"]),
++                 f"Episode {episode_index}: camera extrinsics are incomplete")
++
++        hdf5_path = dataset_root / sidecar["trajectory_sidecar"]
++        with h5py.File(hdf5_path) as handle:
++            demo = handle["data/demo_0"]
++            for key in ("actions", "initial_state", "states/rigid_object", "bbox/bbox_mm"):
++                _require(key in demo, f"Episode {episode_index}: HDF5 sidecar missing {key}")
++            actions = demo["actions"][:]
++            _require(actions.shape == (length, 8), f"Episode {episode_index}: HDF5 action shape mismatch")
++            np.testing.assert_array_equal(np.stack(rows["action.joint_position"]), actions[:, :7])
++            expected_gripper = 1.0 - (actions[:, 7] > 0.5).astype(np.float32)
++            np.testing.assert_array_equal(np.asarray(rows["action.gripper_position"]), expected_gripper)
++
++    from lerobot.datasets.lerobot_dataset import LeRobotDataset
++
++    dataset = LeRobotDataset(repo_id="local/validation", root=success_root)
++    _require(dataset.num_episodes == len(episodes), "LeRobot loader episode count mismatch")
++    _require(dataset.num_frames == len(data), "LeRobot loader frame count mismatch")
++
++    if check_cosmos_loader:
++        from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
++
++        cosmos_dataset = DROIDLeRobotDataset(
++            root=str(dataset_root),
++            split="train",
++            split_val_ratio=0.0,
++            action_space="joint_pos",
++            use_state=True,
++            use_success_only=True,
++            viewpoint="concat_view",
++            chunk_length=1,
++        )
++        _require(len(cosmos_dataset) > 0, "Cosmos loader produced no training samples")
++        sample = cosmos_dataset[0]
++        _require(tuple(sample["action"].shape[-1:]) == (8,), "Cosmos loader action shape mismatch")
++
++    return {"episodes": len(episodes), "frames": len(data), "videos": len(episodes) * len(IMAGE_FEATURES)}
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("dataset", help="Trajectory root or its success/ subdirectory")
++    parser.add_argument(
++        "--check-cosmos-loader",
++        action="store_true",
++        help="Also instantiate Cosmos' DROID joint-position training loader (run from a Cosmos environment).",
++    )
++    args = parser.parse_args()
++    result = validate_dataset(args.dataset, check_cosmos_loader=args.check_cosmos_loader)
++    print(
++        "VALID: "
++        f"{result['episodes']} successful episodes, {result['frames']} aligned frames, "
++        f"{result['videos']} H.264 videos"
++    )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_droid_lerobot_trajectory.py b/tests/test_droid_lerobot_trajectory.py
+new file mode 100644
+index 0000000..d079254
+--- /dev/null
++++ b/tests/test_droid_lerobot_trajectory.py
+@@ -0,0 +1,263 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++import numpy as np
++import pandas as pd
++import pytest
++import torch
++
++from robolab.core.logging.droid_lerobot_trajectory import (
++    IMAGE_FEATURES,
++    DroidLeRobotTrajectoryRecorder,
++    DroidTrajectoryConfig,
++    _official_droid_gripper,
++    _resize_rgb_batch,
++    _resize_rgb_streams,
++    build_droid_frame,
++    droid_features,
++)
++from robolab.core.logging.lerobot_trajectory import (
++    LeRobotVideoEpisode,
++    VideoEncodingConfig,
++    VideoStreamConfig,
++    resize_rgb_streams,
++    video_features,
++)
++
++
++def test_generic_video_streams_support_custom_mapping_resolution_and_fps():
++    streams = (
++        VideoStreamConfig("observation.images.front", "front_cam", 320, 180),
++        VideoStreamConfig("observation.images.wrist", "hand_cam", 160, 120),
++    )
++    features = video_features(streams)
++    assert features["observation.images.front"]["shape"] == (180, 320, 3)
++    assert features["observation.images.wrist"]["shape"] == (120, 160, 3)
++    VideoEncodingConfig(fps=30, codec="libx264", queue_frames=2).validate()
++
++    observations = {
++        "front_cam": torch.full((2, 360, 640, 3), 31, dtype=torch.uint8),
++        "hand_cam": torch.full((2, 240, 320, 3), 47, dtype=torch.uint8),
++    }
++    resized = resize_rgb_streams(observations, [1], streams)
++    assert resized["observation.images.front"].shape == (1, 180, 320, 3)
++    assert resized["observation.images.wrist"].shape == (1, 120, 160, 3)
++    assert resized["observation.images.front"][0, 0, 0, 0] == 31
++    assert resized["observation.images.wrist"][0, 0, 0, 0] == 47
++
++
++def test_generic_video_episode_writes_custom_lerobot_stream(tmp_path):
++    pytest.importorskip("lerobot")
++    av = pytest.importorskip("av")
++    from lerobot.datasets.lerobot_dataset import LeRobotDataset
++
++    streams = (VideoStreamConfig("observation.images.front", "front_cam", 320, 180),)
++    features = {
++        **video_features(streams),
++        "observation.state": {"dtype": "float32", "shape": (2,), "names": ["a", "b"]},
++        "action": {"dtype": "float32", "shape": (1,), "names": ["command"]},
++    }
++    dataset = LeRobotDataset.create(
++        repo_id="local/custom-stream-smoke",
++        root=tmp_path / "dataset",
++        fps=30,
++        robot_type="test",
++        features=features,
++        use_videos=True,
++        vcodec="h264",
++    )
++    episode = LeRobotVideoEpisode(
++        dataset=dataset,
++        source_root=tmp_path / "dataset",
++        streams=streams,
++        encoding=VideoEncodingConfig(fps=30, queue_frames=2),
++    )
++    episode.start()
++    for value in (25, 75):
++        episode.add_frame(
++            {
++                "observation.images.front": np.full((180, 320, 3), value, np.uint8),
++                "observation.state": np.array([value, value + 1], np.float32),
++                "action": np.array([value], np.float32),
++                "task": "custom stream smoke",
++            }
++        )
++    episode.close()
++    episode.save()
++    dataset.finalize()
++    video_path = tmp_path / "dataset" / dataset.meta.get_video_file_path(0, "observation.images.front")
++    with av.open(str(video_path)) as container:
++        stream = container.streams.video[0]
++        assert (stream.width, stream.height) == (320, 180)
++        assert float(stream.average_rate) == 30
++        assert sum(1 for _ in container.decode(video=0)) == 2
++
++
++def test_schema_matches_cosmos_droid_joint_position_contract():
++    features = droid_features()
++    assert set(IMAGE_FEATURES) <= set(features)
++    assert features["observation.image.wrist_image_left"]["shape"] == (360, 640, 3)
++    assert features["observation.state.joint_positions"]["shape"] == (7,)
++    assert features["observation.state.cartesian_position"]["shape"] == (6,)
++    assert features["action.joint_position"]["shape"] == (7,)
++    assert features["action.gripper_position"]["shape"] == (1,)
++
++
++def test_gripper_is_saved_in_raw_droid_convention_once():
++    np.testing.assert_array_equal(_official_droid_gripper(0.0), [1.0])  # RoboLab open -> DROID open
++    np.testing.assert_array_equal(_official_droid_gripper(1.0), [0.0])  # RoboLab closed -> DROID closed
++    # Cosmos' current droid_plus loader applies exactly one 1-x transform.
++    np.testing.assert_array_equal(1.0 - _official_droid_gripper(0.0), [0.0])
++    np.testing.assert_array_equal(1.0 - _official_droid_gripper(1.0), [1.0])
++
++
++def test_frame_keeps_observation_and_executed_action_from_same_step():
++    images = {key: np.full((360, 640, 3), 17, np.uint8) for key in IMAGE_FEATURES}
++    frame = build_droid_frame(
++        images=images,
++        joint_positions=np.arange(7, dtype=np.float32) + 10,
++        gripper_position=np.array([0.0], dtype=np.float32),
++        ee_position=np.array([1, 2, 3], dtype=np.float32),
++        ee_quaternion_wxyz=np.array([1, 0, 0, 0], dtype=np.float32),
++        executed_action=np.arange(8, dtype=np.float32),
++        task="test task",
++    )
++    np.testing.assert_array_equal(frame["observation.state.joint_positions"], np.arange(7) + 10)
++    np.testing.assert_array_equal(frame["action.joint_position"], np.arange(7))
++    assert frame["task"] == "test task"
++    assert frame["observation.state.cartesian_position"].shape == (6,)
++
++
++def test_resize_is_batched_uint8_and_selects_requested_envs():
++    source = torch.zeros((3, 720, 1280, 3), dtype=torch.uint8)
++    source[2].fill_(123)
++    resized = _resize_rgb_batch(source, [2, 0])
++    assert resized.shape == (2, 360, 640, 3)
++    assert resized.dtype == np.uint8
++    assert resized[0, 0, 0, 0] == 123
++    assert resized[1, 0, 0, 0] == 0
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
++def test_resize_accepts_cuda_uint8():
++    source = torch.full((2, 720, 1280, 3), 91, dtype=torch.uint8, device="cuda")
++    resized = _resize_rgb_batch(source, [1])
++    assert resized.shape == (1, 360, 640, 3)
++    assert resized.dtype == np.uint8
++    assert np.all(resized == 91)
++
++
++def test_resize_streams_preserves_camera_and_env_order():
++    images = {}
++    for camera_index, camera in enumerate(IMAGE_FEATURES.values()):
++        batch = torch.empty((2, 720, 1280, 3), dtype=torch.uint8)
++        batch[0].fill_(camera_index * 10)
++        batch[1].fill_(camera_index * 10 + 1)
++        images[camera] = batch
++    resized = _resize_rgb_streams(images, [1, 0])
++    for camera_index, feature in enumerate(IMAGE_FEATURES):
++        assert resized[feature].shape == (2, 360, 640, 3)
++        assert resized[feature][0, 0, 0, 0] == camera_index * 10 + 1
++        assert resized[feature][1, 0, 0, 0] == camera_index * 10
++
++
++def test_config_rejects_non_training_resolution(tmp_path):
++    path = tmp_path / "trajectory.yaml"
++    path.write_text("checkpoint: test\nimage_width: 320\nimage_height: 180\n")
++    with pytest.raises(ValueError, match="640x360"):
++        DroidTrajectoryConfig.from_yaml(path)
++
++
++def test_config_rejects_unvalidated_codec(tmp_path):
++    path = tmp_path / "trajectory.yaml"
++    path.write_text("checkpoint: test\ncodec: hevc\n")
++    with pytest.raises(ValueError, match="h264"):
++        DroidTrajectoryConfig.from_yaml(path)
++
++
++def _append_test_frames(recorder, slot, count=3):
++    recorder._start_streams(slot)
++    for frame_index in range(count):
++        images = {
++            key: np.full((360, 640, 3), 20 + camera_index + frame_index, np.uint8)
++            for camera_index, key in enumerate(IMAGE_FEATURES)
++        }
++        frame = build_droid_frame(
++            images=images,
++            joint_positions=np.arange(7, dtype=np.float32) + frame_index,
++            gripper_position=np.array([frame_index % 2], dtype=np.float32),
++            ee_position=np.array([1, 2, 3], dtype=np.float32),
++            ee_quaternion_wxyz=np.array([1, 0, 0, 0], dtype=np.float32),
++            executed_action=np.r_[np.arange(7, dtype=np.float32), np.float32(frame_index % 2)],
++            task="pick the banana",
++        )
++        recorder._add_streamed_frame(slot, frame)
++        slot.frame_count += 1
++
++
++def test_streaming_dataset_commits_success_and_discards_failure(tmp_path):
++    pytest.importorskip("lerobot")
++    av = pytest.importorskip("av")
++    from lerobot.datasets.lerobot_dataset import LeRobotDataset
++
++    recorder = DroidLeRobotTrajectoryRecorder(
++        DroidTrajectoryConfig(
++            output_root=str(tmp_path / "trajectories"),
++            checkpoint="test-checkpoint",
++            sidecar_level="minimal",
++        ),
++        tmp_path,
++    )
++    for env_id in (0, 1):
++        slot = recorder._new_slot(env_id)
++        slot.run_context = {
++            "task": "BananaOnPlateTask",
++            "language_instruction": "pick the banana",
++            "run_index": 0,
++            "env_id": env_id,
++            "policy": "test",
++            "checkpoint": "test-checkpoint",
++            "seed": 7,
++            "env_config": "sidecars/env_configs/test.json",
++            "robolab_hdf5": str(tmp_path / "unused.hdf5"),
++        }
++        recorder._slots[env_id] = slot
++        _append_test_frames(recorder, slot)
++
++    recorder._batch_active = True
++    recorder.end_batch(
++        [{"env_id": 0, "success": True}, {"env_id": 1, "success": False}],
++        {"total_s": 1.0},
++        [
++            {"info": "stale subtask status must not override success"},
++            {"info": "time limit"},
++        ],
++    )
++    success_root = recorder.finalize()
++
++    dataset = LeRobotDataset(repo_id=recorder.config.repo_id, root=success_root)
++    assert dataset.num_episodes == 1
++    assert dataset.num_frames == 3
++    parquet = pd.read_parquet(next((success_root / "data").glob("chunk-*/*.parquet")))
++    assert parquet["frame_index"].tolist() == [0, 1, 2]
++    assert parquet["index"].tolist() == [0, 1, 2]
++    assert parquet["timestamp"].tolist() == pytest.approx([0, 1 / 15, 2 / 15])
++    assert parquet["action.gripper_position"].tolist() == [1.0, 0.0, 1.0]
++
++    episodes = pd.read_parquet(next((success_root / "meta" / "episodes").glob("chunk-*/*.parquet")))
++    assert episodes["termination_reason"].tolist() == ["success"]
++    sidecar = next((recorder.output_root / "sidecars" / "success").rglob("*.json"))
++    sidecar_data = __import__("json").loads(sidecar.read_text())
++    assert sidecar_data["termination_reason"] == "success"
++    assert sidecar_data["recording_timing"]["lerobot_commit_s"] >= 0
++
++    for video_key in IMAGE_FEATURES:
++        video_path = success_root / dataset.meta.get_video_file_path(0, video_key)
++        with av.open(str(video_path)) as container:
++            assert sum(1 for _ in container.decode(video=0)) == 3
++
++    assert not (recorder.staging_root / "env-001").exists()
++    failure_sidecars = list((recorder.output_root / "sidecars" / "failure").rglob("*.json"))
++    assert len(failure_sidecars) == 1
++    failure = __import__("json").loads(failure_sidecars[0].read_text())
++    assert failure["termination_reason"] == "time limit"
+diff --git a/tests/test_recorder_cpu_streaming.py b/tests/test_recorder_cpu_streaming.py
+index 1456d12..8d7bb6c 100644
+--- a/tests/test_recorder_cpu_streaming.py
++++ b/tests/test_recorder_cpu_streaming.py
+@@ -1,9 +1,13 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
+ 
++import threading
++import time
+ from types import SimpleNamespace
+ 
+ import h5py
++import numpy as np
++import pytest
+ import torch
+ from isaaclab.managers.recorder_manager import DatasetExportMode
+ from isaaclab.utils.datasets import EpisodeData
+@@ -14,6 +18,7 @@ from robolab.core.logging.recorder_manager import (
+     _to_recording_device,
+ )
+ from robolab.core.logging.streaming_hdf5_handler import StreamingHDF5DatasetFileHandler
++from robolab.core.utils import video_utils
+ 
+ 
+ def _assert_cpu_tree(value):
+@@ -134,3 +139,56 @@ def test_chunked_episode_preserves_nontensor_leaves_for_export():
+     episode = _ChunkedEpisodeData()
+     episode.add("initial_state/object/root_pose", [0.0, 0.0, 0.0, 1.0])
+     assert episode.data["initial_state"]["object"]["root_pose"] == [[0.0, 0.0, 0.0, 1.0]]
++
++
++def test_async_video_writer_applies_bounded_backpressure(monkeypatch, tmp_path):
++    encoder_started = threading.Event()
++    allow_encoder = threading.Event()
++
++    class BlockingWriter:
++        def __init__(self, *_args, **_kwargs):
++            pass
++
++        def write(self, _frame):
++            encoder_started.set()
++            assert allow_encoder.wait(timeout=5)
++
++        def release(self):
++            pass
++
++    monkeypatch.setattr(video_utils, "VideoWriter", BlockingWriter)
++    writer = video_utils.AsyncVideoWriter(str(tmp_path / "bounded.mp4"), 15, queue_frames=1)
++    frame = np.zeros((2, 2, 3), dtype=np.uint8)
++    writer.write(frame)
++    assert encoder_started.wait(timeout=1)
++    writer.write(frame)
++
++    third_write_done = threading.Event()
++    producer = threading.Thread(target=lambda: (writer.write(frame), third_write_done.set()))
++    producer.start()
++    time.sleep(0.15)
++    assert not third_write_done.is_set()
++
++    allow_encoder.set()
++    producer.join(timeout=2)
++    assert third_write_done.is_set()
++    writer.release()
++
++
++def test_async_video_writer_propagates_worker_failure(monkeypatch, tmp_path):
++    class FailingWriter:
++        def __init__(self, *_args, **_kwargs):
++            pass
++
++        def write(self, _frame):
++            raise OSError("encoder failed")
++
++        def release(self):
++            pass
++
++    monkeypatch.setattr(video_utils, "VideoWriter", FailingWriter)
++    writer = video_utils.AsyncVideoWriter(str(tmp_path / "failed.mp4"), 15, queue_frames=1)
++    writer.write(np.zeros((2, 2, 3), dtype=np.uint8))
++    assert writer._done.wait(timeout=1)
++    with pytest.raises(RuntimeError, match="Background video encoding failed"):
++        writer.release()
+-- 
+2.34.1
+
