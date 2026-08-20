@@ -124,6 +124,7 @@ def _gptq_uint4b8_quantize_vllm_compatible(
     q_weight = q_weight + 8
 
     if grouped_layout:
+
         def restore(t: torch.Tensor) -> torch.Tensor:
             return t.reshape((group_size, -1, size_n)).permute(1, 0, 2).reshape((size_k, size_n)).contiguous()
 
@@ -320,6 +321,122 @@ class VllmGptqMarlinW8A16Linear(nn.Module):
         return out.reshape(x.shape[:-1] + (self.size_n,)).to(torch.bfloat16)
 
 
+class VllmCutlassFp8W8A8Linear(nn.Module):
+    """CUTLASS FP8 linear with per-channel weights and dynamic per-token activations."""
+
+    def __init__(self, weight: torch.Tensor, input_scale: torch.Tensor | None = None) -> None:
+        super().__init__()
+        if not torch.cuda.is_available() or weight.device.type != "cuda":
+            raise RuntimeError("vLLM CUTLASS FP8 backend requires CUDA tensors")
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("vLLM CUTLASS FP8 backend requires torch.float8_e4m3fn")
+
+        import vllm._C  # noqa: F401  # Registers vLLM CUTLASS and quant kernels.
+        from vllm import _custom_ops as ops
+
+        capability = torch.cuda.get_device_capability(weight.device)
+        capability_int = capability[0] * 10 + capability[1]
+        if capability_int < 89 or not ops.cutlass_scaled_mm_supports_fp8(capability_int):
+            raise RuntimeError(f"vLLM CUTLASS FP8 W8A8 requires native FP8 support (SM89+), got SM{capability_int}")
+
+        self.size_n, self.size_k = weight.shape
+        self.num_bits = 8
+        self.activation_bits = 8
+        self.fp8_max = 448.0
+        weight_nk = weight.detach().to(torch.bfloat16).contiguous()
+        if input_scale is not None:
+            if input_scale.numel() != self.size_k:
+                raise ValueError(f"input_scale must have {self.size_k} elements, got {input_scale.numel()}")
+            scale = input_scale.detach().to(device=weight.device, dtype=torch.bfloat16).reshape(1, self.size_k)
+            weight_nk = weight_nk * scale
+            self.register_buffer("input_scale", scale.reshape(self.size_k), persistent=False)
+        else:
+            self.input_scale = None
+        scale_b = (weight_nk.abs().amax(dim=1, keepdim=True).float() / self.fp8_max).clamp(min=1e-8)
+        qweight_nk = (weight_nk / scale_b).clamp(-self.fp8_max, self.fp8_max).to(torch.float8_e4m3fn)
+        self.register_buffer("qweight_nk", qweight_nk.contiguous(), persistent=False)
+        self.register_buffer("scale_b", scale_b.reshape(1, self.size_n).contiguous(), persistent=False)
+
+    @staticmethod
+    def _ops():
+        from vllm import _custom_ops as ops
+
+        return ops
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        if self.input_scale is not None:
+            x_2d = (x_2d / self.input_scale).contiguous()
+        q_x, scale_a = self.quantize_input(x_2d)
+        out = self.forward_quantized(q_x, scale_a)
+        return out.reshape(x.shape[:-1] + (self.size_n,)).to(torch.bfloat16)
+
+    def quantize_input(self, x_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._ops().scaled_fp8_quant(x_2d, use_per_token_if_dynamic=True)
+
+    def forward_quantized(self, q_x: torch.Tensor, scale_a: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "gemm_backend", "cutlass") == "triton_sm89":
+            from cosmos_framework.scripts import sm89_fp8_gemm
+
+            qweight = self.qweight_nk.t()
+            if sm89_fp8_gemm.supports_shape(q_x, qweight):
+                return sm89_fp8_gemm.scaled_mm(q_x, qweight, scale_a, self.scale_b)
+        return self._ops().cutlass_scaled_mm(
+            q_x,
+            self.qweight_nk.t(),
+            scale_a,
+            self.scale_b,
+            torch.bfloat16,
+        )
+
+
+class VllmCutlassFp8ProjectionGroup(nn.Module):
+    """Share dynamic activation quantization across compatible FP8 projections."""
+
+    def __init__(self, projections: list[VllmCutlassFp8W8A8Linear]) -> None:
+        super().__init__()
+        if len(projections) < 2:
+            raise ValueError("An FP8 projection group requires at least two projections")
+        size_k = projections[0].size_k
+        if any(projection.size_k != size_k for projection in projections):
+            raise ValueError("Grouped FP8 projections must have the same input width")
+        input_scales = [projection.input_scale for projection in projections]
+        if any(scale is None for scale in input_scales) and not all(scale is None for scale in input_scales):
+            raise ValueError("Grouped FP8 projections must either all use or all omit input scaling")
+        if input_scales[0] is not None:
+            if any(not torch.equal(input_scales[0], scale) for scale in input_scales[1:]):
+                raise ValueError("Grouped FP8 projections must use identical input scales")
+            self.register_buffer("input_scale", input_scales[0], persistent=False)
+        else:
+            self.input_scale = None
+        self.size_k = size_k
+        self.out_features = tuple(projection.size_n for projection in projections)
+        self.projections = nn.ModuleList(projections)
+
+    @staticmethod
+    def _ops():
+        from vllm import _custom_ops as ops
+
+        return ops
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        if self.input_scale is not None:
+            x_2d = (x_2d / self.input_scale).contiguous()
+        q_x, scale_a = self._ops().scaled_fp8_quant(x_2d, use_per_token_if_dynamic=True)
+        outputs = tuple(projection.forward_quantized(q_x, scale_a) for projection in self.projections)
+        prefix = x.shape[:-1]
+        return tuple(
+            output.reshape(prefix + (size_n,)).to(torch.bfloat16)
+            for output, size_n in zip(outputs, self.out_features, strict=True)
+        )
+
+    def _apply(self, fn, recurse: bool = True):
+        # Runtime groups are assembled after their packed buffers are already
+        # on the deployment device. A parent to_empty() must not destroy them.
+        return self
+
+
 class VllmAllSparkW8A16Linear(nn.Module):
     def __init__(self, weight: torch.Tensor) -> None:
         super().__init__()
@@ -407,6 +524,8 @@ def _make_backend(name: str, weight: torch.Tensor) -> nn.Module:
         return VllmGptqMarlinW4A16Linear(weight)
     if name == "vllm_gptq_marlin_w8a16":
         return VllmGptqMarlinW8A16Linear(weight)
+    if name == "vllm_cutlass_fp8_w8a8":
+        return VllmCutlassFp8W8A8Linear(weight)
     if name == "vllm_allspark_w8a16":
         return VllmAllSparkW8A16Linear(weight)
     raise ValueError(f"Unsupported backend {name!r}")
@@ -649,7 +768,9 @@ def main() -> None:
     parser.add_argument("--in-features", type=int, default=4096)
     parser.add_argument("--out-features", type=int, default=12288)
     parser.add_argument("--shape-file", default="", help="Optional JSONL from COSMOS3_LINEAR_SHAPES_JSONL.")
-    parser.add_argument("--max-shapes", type=int, default=16, help="Top shape groups to benchmark when --shape-file is set.")
+    parser.add_argument(
+        "--max-shapes", type=int, default=16, help="Top shape groups to benchmark when --shape-file is set."
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
@@ -678,6 +799,7 @@ def main() -> None:
         "notes": {
             "vllm_gptq_marlin_w4a16": "offline symmetric per-group W4 quantization; forward uses vLLM Marlin ops only",
             "vllm_gptq_marlin_w8a16": "offline symmetric per-channel W8 quantization; forward uses vLLM Marlin ops only",
+            "vllm_cutlass_fp8_w8a8": "offline per-channel FP8 weights and dynamic per-token FP8 activations; requires SM89+",
             "vllm_allspark_w8a16": "offline symmetric per-channel W8 quantization; forward uses vLLM AllSpark ops; gated to 80 <= SM < 90",
             "storage_gb": "module parameter/buffer bytes only; excludes temporary original BF16 tensors held by harness",
         },

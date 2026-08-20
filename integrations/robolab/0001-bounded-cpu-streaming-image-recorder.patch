@@ -1,0 +1,924 @@
+From eb883a35e4a29ceb7345727e690cfafcf2fde912 Mon Sep 17 00:00:00 2001
+From: Xiangyu Li <xiangyu.sdlc@foxmail.com>
+Date: Wed, 19 Aug 2026 22:50:14 +0800
+Subject: [PATCH] Add bounded CPU streaming for image recording
+
+---
+ docs/data.md                                  |  32 +++-
+ docs/environment_run.md                       |   2 +
+ examples/run_empty.py                         |  27 ++-
+ policies/cosmos3/run.py                       |  14 ++
+ robolab/core/events/basic_recorders.py        |  24 ++-
+ robolab/core/logging/recorder_manager.py      | 174 ++++++++++++++++--
+ .../core/logging/streaming_hdf5_handler.py    |  49 ++++-
+ robolab/eval/runner.py                        |  12 ++
+ scripts/validate_recording.py                 |  72 ++++++++
+ tests/test_recorder_cpu_streaming.py          | 136 ++++++++++++++
+ 10 files changed, 511 insertions(+), 31 deletions(-)
+ create mode 100644 scripts/validate_recording.py
+ create mode 100644 tests/test_recorder_cpu_streaming.py
+
+diff --git a/docs/data.md b/docs/data.md
+index 84b7738..1145cb6 100644
+--- a/docs/data.md
++++ b/docs/data.md
+@@ -2,8 +2,38 @@
+ 
+ By default, proprio data will be recorded in the hdf5 file. To turn on image data recording, `robolab.constants.RECORD_IMAGE_DATA` needs to be set to True.
+ 
++Recorded tensors are transferred from the simulator GPU to CPU at the recorder
++boundary. Policy input tensors remain on the simulator GPU; only the persistent
++recording copy moves. The image recorder keeps `image_obs` and `proprio_obs` by
++default, excluding the viewport-only render group.
++
++Choose an HDF5 storage profile according to the workload:
++
++| Profile | Image codec | Image chunk | Flush | Use case |
++| --- | --- | --- | ---: | --- |
++| `fast` (default with images) | none | one frame | 8 steps | High-concurrency collection to local NVMe |
++| `balanced` | LZF | one frame | 16 steps | Smaller files with moderate CPU cost |
++| `compact` | gzip | automatic | 32 steps | Archival when write latency is unimportant |
++
++Use `--record-storage-profile PROFILE` and optionally
++`--record-flush-interval N`. A smaller flush interval reduces host-memory peaks
++and repeated concatenation, but writes more often. Setting the interval to `0`
++disables periodic flushing and is unsafe for long image-bearing episodes.
++
++The fast profile intentionally trades disk space for collection throughput.
++Write to node-local NVMe, then compress or convert the completed dataset
++offline. Shared filesystems and gzip can become the bottleneck even after GPU
++memory is fixed.
++
+ Recorded episodes can be played back — see [Replaying Recorded Episodes](replay.md).
+ 
++Validate a completed multi-env file before moving it into a training dataset:
++
++```bash
++python scripts/validate_recording.py run_0.hdf5 \
++  --expected-demos 10 --expected-steps 1800
++```
++
+ ## Single-Env vs Multi-Env Recording
+ 
+ RoboLab supports running multiple parallel environments per task. The recording system handles both cases:
+@@ -20,7 +50,7 @@ RoboLab supports running multiple parallel environments per task. The recording
+ - Subtask logs: `log_{run_idx}_env{env_id}.json` (one per env)
+ - Each env has its own subtask state machine, event tracker, and termination state
+ - Envs terminate independently — when an env succeeds, it freezes while others continue
+-- HDF5 recording uses auto-flush (every 500 steps) with concurrent per-env streaming — each env's buffer is flushed to its own demo without interfering with other envs
++- HDF5 recording uses concurrent per-env streaming. The image profile selects an 8, 16, or 32-step default; low-dimensional recording keeps the 500-step default. Each env is assigned a stable demo index before its first flush.
+ - Total episodes = `num_runs * num_envs`
+ 
+ > **Tip:** Prefer increasing `--num_envs` for more episodes. Only increase `--num-runs` (default 1) if you run out of GPU memory with the desired `num_envs`. For example, to run 24 episodes when only 12 fit in VRAM: `--num_envs 12 --num-runs 2`.
+diff --git a/docs/environment_run.md b/docs/environment_run.md
+index ccae991..37cb78f 100644
+--- a/docs/environment_run.md
++++ b/docs/environment_run.md
+@@ -380,6 +380,8 @@ The built-in `policies/pi0_family/run.py` supports the full set of evaluation fe
+ | `--disable-subtask` | Disable subtask progress checking (drops score, reason, subtask log from results; tracking is on by default) | `False` |
+ | `--enable-gt-state` | Export per-env ground-truth simulator state to the inference client each step (`obs["gt_state"] = {env_id: state}`). See [Ground-Truth State Export](#ground-truth-state-export). | `False` |
+ | `--record-image-data` | Record image observations to HDF5 | `False` |
++| `--record-storage-profile` | HDF5 image storage: `fast` (uncompressed), `balanced` (LZF), or `compact` (gzip) | `fast` with images |
++| `--record-flush-interval` | Override the profile's bounded HDF5 flush interval | automatic |
+ | `--video-mode MODE` | Which videos to save: `all` (sensor + viewport), `viewport` only, `sensor` only, or `none` | `all` |
+ | `--renderer MODE` | RTX renderer: `realtime` (RaytracedLighting) or `pathtracing` (PathTracing). See [Renderer Selection](#renderer-selection). | `realtime` |
+ | `--rendering-type MODE` | Realtime quality preset: `performance`, `balanced`, or `quality`. No effect under `--renderer pathtracing`. | IsaacLab default (`balanced`) |
+diff --git a/examples/run_empty.py b/examples/run_empty.py
+index 35d6e5c..7ec080a 100644
+--- a/examples/run_empty.py
++++ b/examples/run_empty.py
+@@ -53,6 +53,16 @@ parser.add_argument("--task", nargs='+', default=None,
+ parser.add_argument("--tag", nargs='+', default=None,
+                        help="List of tags of tasks to evaluate on ")
+ parser.add_argument("--num-steps", type=int, default=50, help="Number of steps to run the environment for.")
++parser.add_argument("--record-image-data", "--record_image_data", action="store_true",
++                    help="Record policy observations to HDF5 while stepping.")
++parser.add_argument("--record-flush-interval", "--record_flush_interval", type=int, default=None,
++                    help="Override the automatic HDF5 chunk size in environment steps.")
++parser.add_argument("--record-storage-profile", choices=("fast", "balanced", "compact"), default=None,
++                    help="Select the image-recording HDF5 speed/size tradeoff.")
++parser.add_argument("--camera-preset", choices=("wrist-left", "cosmos3"), default="wrist-left",
++                    help="Observation camera preset; cosmos3 uses wrist, left, right, and head.")
++parser.add_argument("--output-dir", default=None,
++                    help="Override the default output/run_empty_env directory.")
+ 
+ # parse the arguments
+ args_cli, _= parser.parse_known_args()
+@@ -65,6 +75,7 @@ from robolab.constants import PACKAGE_DIR, set_output_dir # noqa
+ from episodes import run_empty_episode # noqa
+ from robolab.core.environments.runtime import create_env, end_episode # noqa
+ from robolab.registrations.droid.auto_env_registrations_jointpos import auto_register_droid_envs # noqa
++from robolab.registrations.droid.camera_presets import WRIST_LEFT, WRIST_LEFT_RIGHT_HEAD # noqa
+ from robolab.core.environments.factory import get_envs # noqa
+ from robolab.constants import get_timestamp # noqa
+ from robolab.core.logging.results import dump_results_to_file, get_all_env_events, summarize_experiment_results # noqa
+@@ -72,16 +83,17 @@ from robolab.core.logging.results import init_experiment, update_experiment_resu
+ import robolab.constants # noqa
+ 
+ # Run automatic factory generation before main
+-auto_register_droid_envs()
++camera_preset = WRIST_LEFT_RIGHT_HEAD if args_cli.camera_preset == "cosmos3" else WRIST_LEFT
++auto_register_droid_envs(task=args_cli.task, cameras=camera_preset)
+ 
+ robolab.constants.VERBOSE = True
+ robolab.constants.DEBUG = False
+-robolab.constants.RECORD_IMAGE_DATA = False
++robolab.constants.RECORD_IMAGE_DATA = args_cli.record_image_data
+ 
+ def main():
+     """Main function."""
+     num_episodes = 1
+-    output_dir = os.path.join(PACKAGE_DIR, "output", "run_empty_env")
++    output_dir = args_cli.output_dir or os.path.join(PACKAGE_DIR, "output", "run_empty_env")
+     os.makedirs(output_dir, exist_ok=True)
+ 
+     if args_cli.task:
+@@ -103,6 +115,10 @@ def main():
+             device=args_cli.device,
+             num_envs=args_cli.num_envs,
+             use_fabric=True)
++        if args_cli.record_storage_profile is not None:
++            env.recorder_manager.set_storage_profile(args_cli.record_storage_profile)
++        if args_cli.record_flush_interval is not None:
++            env.recorder_manager.set_flush_interval(args_cli.record_flush_interval)
+ 
+         for i in range(num_episodes):
+ 
+@@ -110,6 +126,11 @@ def main():
+             run_name = task_env + f"_{i}"
+             print(f"Running {run_name}: '{env_cfg.instruction}'")
+ 
++            if hasattr(env.recorder_manager, "set_hdf5_file"):
++                env.recorder_manager.set_hdf5_file(f"run_{i}.hdf5")
++                for env_id in range(env.num_envs):
++                    env.recorder_manager.set_episode_index(env_id, env_ids=[env_id])
++
+             succ, msgs = run_empty_episode(env,
+                 env_cfg=env_cfg,
+                 num_envs=args_cli.num_envs,
+diff --git a/policies/cosmos3/run.py b/policies/cosmos3/run.py
+index 2e21887..d1a335d 100644
+--- a/policies/cosmos3/run.py
++++ b/policies/cosmos3/run.py
+@@ -19,6 +19,14 @@ parser.add_argument(
+ parser.add_argument(
+     "--remote-port", default=8000, type=int, help="Remote port for policy server (default: 8000)."
+ )
++parser.add_argument(
++    "--record-image-data",
++    "--record_image_data",
++    action="store_true",
++    help="Record policy observations to the streaming HDF5 dataset.",
++)
++parser.add_argument("--enable-verbose", "--enable_verbose", action="store_true")
++parser.add_argument("--enable-debug", "--enable_debug", action="store_true")
+ 
+ from robolab.eval.runner import add_common_eval_args, run_evaluation
+ 
+@@ -31,10 +39,16 @@ args_cli.enable_cameras = True
+ app_launcher = AppLauncher(args_cli)
+ simulation_app = app_launcher.app
+ 
++import robolab.constants
+ from policies.cosmos3.client import Cosmos3Client
+ from robolab.registrations.droid.auto_env_registrations_jointpos import auto_register_droid_envs
+ from robolab.registrations.droid.camera_presets import WRIST_LEFT_RIGHT_HEAD
+ 
++robolab.constants.ENABLE_SUBTASK_PROGRESS_CHECKING = args_cli.enable_subtask
++robolab.constants.RECORD_IMAGE_DATA = args_cli.record_image_data
++robolab.constants.VERBOSE = args_cli.enable_verbose
++robolab.constants.DEBUG = args_cli.enable_debug
++
+ auto_register_droid_envs(task=args_cli.task, cameras=WRIST_LEFT_RIGHT_HEAD)
+ 
+ 
+diff --git a/robolab/core/events/basic_recorders.py b/robolab/core/events/basic_recorders.py
+index eb18076..ba40656 100644
+--- a/robolab/core/events/basic_recorders.py
++++ b/robolab/core/events/basic_recorders.py
+@@ -102,8 +102,19 @@ class PreStepActionsRecorder(RecorderTerm):
+ class PreStepFlatPolicyObservationsRecorder(RecorderTerm):
+     """Recorder term that records the policy group observations in each step."""
+ 
++    def __init__(self, cfg: "PreStepFlatPolicyObservationsRecorderCfg", env):
++        super().__init__(cfg, env)
++        self._observation_groups = cfg.observation_groups
++
+     def record_pre_step(self):
+-        return "obs", self._env.obs_buf
++        observations = self._env.obs_buf
++        if self._observation_groups is not None:
++            observations = {
++                group: observations[group]
++                for group in self._observation_groups
++                if group in observations
++            }
++        return "obs", observations
+ 
+ 
+ class PostStepEndEffectorPoseRecorder(RecorderTerm):
+@@ -323,9 +334,18 @@ class PreStepActionsRecorderCfg(RecorderTermCfg):
+ 
+ @configclass
+ class PreStepFlatPolicyObservationsRecorderCfg(RecorderTermCfg):
+-    """Configuration for the step policy observation recorder term."""
++    """Configuration for the step policy observation recorder term.
++
++    ``flush_interval`` bounds the number of image-bearing steps retained in
++    host memory before they are appended to HDF5. The recorder manager owns the
++    device transfer; recorded tensors never remain CUDA-resident in the buffer.
++    ``observation_groups`` excludes viewport-only render products by default;
++    set it to ``None`` to retain every observation group.
++    """
+ 
+     class_type: type[RecorderTerm] = PreStepFlatPolicyObservationsRecorder
++    flush_interval: int = 8
++    observation_groups: tuple[str, ...] | None = ("image_obs", "proprio_obs")
+ 
+ 
+ @configclass
+diff --git a/robolab/core/logging/recorder_manager.py b/robolab/core/logging/recorder_manager.py
+index 52e3a9b..ac5993b 100644
+--- a/robolab/core/logging/recorder_manager.py
++++ b/robolab/core/logging/recorder_manager.py
+@@ -1,7 +1,6 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-import gc
+ import logging
+ import os
+ from collections.abc import Sequence
+@@ -16,6 +15,58 @@ from robolab.core.logging.streaming_hdf5_handler import StreamingHDF5DatasetFile
+ 
+ logger = logging.getLogger(__name__)
+ 
++_STORAGE_PROFILES = {
++    "fast": {"compression": None, "image_chunk_frames": 1, "flush_interval": 8},
++    "balanced": {"compression": "lzf", "image_chunk_frames": 1, "flush_interval": 16},
++    "compact": {"compression": "gzip", "image_chunk_frames": None, "flush_interval": 32},
++}
++
++
++class _ChunkedEpisodeData(EpisodeData):
++    """Defer image-history concatenation until a bounded HDF5 flush."""
++
++    def __init__(self):
++        super().__init__()
++        self._chunks: dict[str, list] = {}
++        self._materialized = False
++
++    def add(self, key: str, value: torch.Tensor | dict):
++        if isinstance(value, dict):
++            for sub_key, sub_value in value.items():
++                self.add(f"{key}/{sub_key}", sub_value)
++            return
++        self._chunks.setdefault(key, []).append(value)
++        self._materialized = False
++
++    @property
++    def data(self):
++        if not self._materialized:
++            self._data = {}
++            for key, values in self._chunks.items():
++                pointer = self._data
++                parts = key.split("/")
++                for part in parts[:-1]:
++                    pointer = pointer.setdefault(part, {})
++                pointer[parts[-1]] = (
++                    torch.stack(values, dim=0)
++                    if all(isinstance(value, torch.Tensor) for value in values)
++                    else values
++                )
++            self._materialized = True
++        return self._data
++
++    @data.setter
++    def data(self, data: dict):
++        self._data = data
++        self._chunks = {}
++        self._materialized = True
++
++    def is_empty(self):
++        return not self._chunks and not self._data
++
++    def get_initial_state(self):
++        return self.data.get("initial_state")
++
+ 
+ def get_memory_usage_mb() -> float:
+     """Get current process memory usage in MB."""
+@@ -51,6 +102,25 @@ def _slice_to_envs(value, env_ids):
+     return value
+ 
+ 
++def _to_recording_device(value):
++    """Recursively give long-lived recorder tensors CPU ownership.
++
++    Simulator observations are live CUDA buffers. Keeping clones of them in
++    ``EpisodeData`` makes VRAM grow with the episode horizon. A synchronous CPU
++    copy is intentional here: it is the correctness baseline and provides
++    natural backpressure before data enters the bounded HDF5 buffer.
++    """
++    if isinstance(value, dict):
++        return {key: _to_recording_device(item) for key, item in value.items()}
++    if isinstance(value, list):
++        return [_to_recording_device(item) for item in value]
++    if isinstance(value, tuple):
++        return tuple(_to_recording_device(item) for item in value)
++    if isinstance(value, torch.Tensor):
++        return value.detach().to(device="cpu")
++    return value
++
++
+ def get_episode_data_size(episode: EpisodeData) -> dict:
+     """Get size info about episode data buffer."""
+     if episode.is_empty():
+@@ -118,10 +188,13 @@ class RobolabRecorderManager(RecorderManager):
+         if not isinstance(cfg, RecorderManagerBaseCfg):
+             raise TypeError("Configuration for the recorder manager is not of type RecorderManagerBaseCfg.")
+ 
++        policy_observations_cfg = getattr(self.cfg, "record_policy_observations", None)
++        self._record_on_cpu = policy_observations_cfg is not None
++
+         # create episode data buffer indexed by environment id
+         self._episodes: dict[int, EpisodeData] = dict()
+         for env_id in range(env.num_envs):
+-            self._episodes[env_id] = EpisodeData()
++            self._episodes[env_id] = self._new_episode_data()
+             self._streaming_active[env_id] = False
+ 
+         self._env_name = getattr(env.cfg, "env_name", None)
+@@ -140,16 +213,28 @@ class RobolabRecorderManager(RecorderManager):
+         for env_id in range(env.num_envs):
+             self._current_episode_index[env_id] = None
+ 
+-        # Auto-flush configuration
+-        self._flush_interval: int = 500  # Flush every N steps (0 = disabled)
++        # Image observations are much larger than proprioception. Keep their
++        # host-side concatenation window small while preserving the historical
++        # 500-step interval for low-dimensional evaluation recording.
++        self._flush_interval = (
++            int(policy_observations_cfg.flush_interval)
++            if policy_observations_cfg is not None
++            else 500
++        )
++        if self._flush_interval < 0:
++            raise ValueError(f"flush_interval must be non-negative, got {self._flush_interval}")
+         self._step_count: dict[int, int] = {}
+         for env_id in range(env.num_envs):
+             self._step_count[env_id] = 0
+ 
+         self._auto_flush_verbose: bool = False  # Print diagnostics on auto-flush
++        self._storage_profile = "fast" if policy_observations_cfg is not None else "compact"
+ 
+         self.initialized = True
+ 
++    def _new_episode_data(self) -> EpisodeData:
++        return _ChunkedEpisodeData() if self._record_on_cpu else EpisodeData()
++
+     def get_term(self, term_type: type) -> object | None:
+         """Return the first active recorder term of the given type, or None.
+ 
+@@ -161,6 +246,19 @@ class RobolabRecorderManager(RecorderManager):
+                 return term
+         return None
+ 
++    def add_to_episodes(self, key: str, value: torch.Tensor | dict, env_ids: Sequence[int] | None = None):
++        """Add recorder output after transferring persistent tensors to CPU.
++
++        This is the ownership boundary for every recorder term, including
++        images, actions, and simulator state. It prevents episode-length CUDA
++        growth without changing the live observation buffers used by policies.
++        """
++        if len(self.active_terms) == 0 or key is None:
++            return
++        if self._record_on_cpu:
++            value = _to_recording_device(value)
++        super().add_to_episodes(key, value, env_ids)
++
+     def set_flush_interval(self, interval: int, verbose: bool = False):
+         """Set the automatic flush interval.
+ 
+@@ -168,6 +266,8 @@ class RobolabRecorderManager(RecorderManager):
+             interval: Number of steps between automatic flushes. Set to 0 to disable auto-flush.
+             verbose: If True, print diagnostics when auto-flushing.
+         """
++        if interval < 0:
++            raise ValueError(f"flush interval must be non-negative, got {interval}")
+         self._flush_interval = interval
+         self._auto_flush_verbose = verbose
+         if interval > 0:
+@@ -175,6 +275,15 @@ class RobolabRecorderManager(RecorderManager):
+         else:
+             print(f"[RobolabRecorderManager] Auto-flush disabled")
+ 
++    def set_storage_profile(self, profile: str):
++        """Select the HDF5 speed/size tradeoff before the first flush."""
++        if profile not in _STORAGE_PROFILES:
++            raise ValueError(f"unknown recording storage profile {profile!r}")
++        if self._hdf5_initialized:
++            raise RuntimeError("recording storage profile cannot change after HDF5 initialization")
++        self._storage_profile = profile
++        self._flush_interval = _STORAGE_PROFILES[profile]["flush_interval"]
++
+     def _ensure_hdf5_handler(self, filename: str = None):
+         """Create or switch the HDF5 file handler.
+ 
+@@ -191,16 +300,36 @@ class RobolabRecorderManager(RecorderManager):
+         if self._dataset_file_handler is not None:
+             self._dataset_file_handler.close()
+         else:
+-            self._dataset_file_handler = StreamingHDF5DatasetFileHandler()
++            storage = _STORAGE_PROFILES[self._storage_profile]
++            self._dataset_file_handler = StreamingHDF5DatasetFileHandler(
++                compression=storage["compression"],
++                image_chunk_frames=storage["image_chunk_frames"],
++            )
+ 
+         filepath = os.path.join(cfg.dataset_export_dir_path, filename)
+         self._dataset_file_handler.create(filepath, env_name=self._env_name)
++        policy_observations_cfg = getattr(cfg, "record_policy_observations", None)
++        self._dataset_file_handler.add_env_args({
++            "recording_storage_profile": self._storage_profile,
++            "recording_compression": _STORAGE_PROFILES[self._storage_profile]["compression"],
++            "recording_flush_interval": self._flush_interval,
++            "recorded_observation_groups": (
++                list(policy_observations_cfg.observation_groups)
++                if policy_observations_cfg is not None
++                and policy_observations_cfg.observation_groups is not None
++                else None
++            ),
++        })
+ 
+         if cfg.dataset_export_mode == DatasetExportMode.EXPORT_SUCCEEDED_FAILED_IN_SEPARATE_FILES:
+             if self._failed_episode_dataset_file_handler is not None:
+                 self._failed_episode_dataset_file_handler.close()
+             else:
+-                self._failed_episode_dataset_file_handler = StreamingHDF5DatasetFileHandler()
++                storage = _STORAGE_PROFILES[self._storage_profile]
++                self._failed_episode_dataset_file_handler = StreamingHDF5DatasetFileHandler(
++                    compression=storage["compression"],
++                    image_chunk_frames=storage["image_chunk_frames"],
++                )
+             failed_path = os.path.join(cfg.dataset_export_dir_path, f"{filename}_failed")
+             self._failed_episode_dataset_file_handler.create(failed_path, env_name=self._env_name)
+ 
+@@ -331,12 +460,15 @@ class RobolabRecorderManager(RecorderManager):
+             self.add_to_episodes(key, value, env_ids=active)
+ 
+         if self._flush_interval > 0:
++            due_env_ids = []
+             for env_id in active:
+                 self._step_count[env_id] += 1
+ 
+                 if self._step_count[env_id] >= self._flush_interval:
+-                    self.flush_buffer(env_ids=[env_id], verbose=self._auto_flush_verbose)
++                    due_env_ids.append(env_id)
+                     self._step_count[env_id] = 0
++            if due_env_ids:
++                self.flush_buffer(env_ids=due_env_ids, verbose=self._auto_flush_verbose)
+ 
+     def record_pre_reset(
+         self,
+@@ -427,6 +559,7 @@ class RobolabRecorderManager(RecorderManager):
+         if not self._hdf5_initialized:
+             self._ensure_hdf5_handler()
+ 
++        wrote_to_handlers = set()
+         for env_id in env_ids:
+             if env_id not in self._episodes or self._episodes[env_id].is_empty():
+                 continue
+@@ -453,19 +586,23 @@ class RobolabRecorderManager(RecorderManager):
+ 
+             # Get episode index for this environment (if set)
+             episode_index = self._current_episode_index.get(env_id)
++            if episode_index is None:
++                # Generic recording entry points do not always pre-arm demo
++                # indices like the policy evaluator does. Reserve one before
++                # the first streaming append so concurrent envs cannot all
++                # fall through to the handler's same demo_count.
++                episode_index = target_handler.next_available_episode_index()
++                self._current_episode_index[env_id] = episode_index
+ 
+             # Append data to the current episode (creates one if not started)
+-            # If episode_index is set and episode exists, it will be deleted and recreated
+-            target_handler.append_data(self._episodes[env_id], episode_index=episode_index)
++            target_handler.append_data(
++                self._episodes[env_id], episode_index=episode_index, flush=False
++            )
++            wrote_to_handlers.add(target_handler)
+             self._streaming_active[env_id] = True
+ 
+             # Clear the in-memory buffer (but episode stays open in HDF5)
+-            self._episodes[env_id] = EpisodeData()
+-
+-            # Force garbage collection to actually free memory
+-            gc.collect()
+-            if torch.cuda.is_available():
+-                torch.cuda.empty_cache()
++            self._episodes[env_id] = self._new_episode_data()
+ 
+             # === AFTER FLUSH DIAGNOSTICS ===
+             if verbose:
+@@ -477,6 +614,9 @@ class RobolabRecorderManager(RecorderManager):
+                       f"HDF5 demo_{hdf5_after.get('demo_count', 0)} now has {hdf5_after.get('current_samples', 0):,} samples (+{samples_added})")
+                 print("="*60 + "\n")
+ 
++        for handler in wrote_to_handlers:
++            handler.flush()
++
+         # Clear any term buffers if they support it
+         if hasattr(self, "_terms"):
+             for term in self._terms.values():
+@@ -581,7 +721,7 @@ class RobolabRecorderManager(RecorderManager):
+             # this env's demo is finalized in HDF5. Pairs with the frozen-env
+             # skip in record_post_step: belt for the data we'll never record
+             # again, suspenders for the data already in the buffer at export.
+-            self._episodes[env_id] = EpisodeData()
++            self._episodes[env_id] = self._new_episode_data()
+             self._step_count[env_id] = 0
+ 
+             # Reset episode index after export
+@@ -633,7 +773,7 @@ class RobolabRecorderManager(RecorderManager):
+                                     "env_id=%d during clear(); demo may be incomplete.",
+                                     env_id,
+                                 )
+-                self._episodes[env_id] = EpisodeData()
++                self._episodes[env_id] = self._new_episode_data()
+                 # Reset streaming state since we're clearing
+                 self._streaming_active[env_id] = False
+                 # Reset episode index
+diff --git a/robolab/core/logging/streaming_hdf5_handler.py b/robolab/core/logging/streaming_hdf5_handler.py
+index 05d26e5..66534c6 100644
+--- a/robolab/core/logging/streaming_hdf5_handler.py
++++ b/robolab/core/logging/streaming_hdf5_handler.py
+@@ -36,7 +36,7 @@ class StreamingHDF5DatasetFileHandler(DatasetFileHandlerBase):
+     other envs' open episodes.
+     """
+ 
+-    def __init__(self):
++    def __init__(self, compression: str | None = "gzip", image_chunk_frames: int | None = None):
+         self._hdf5_file_stream = None
+         self._hdf5_data_group = None
+         self._demo_count = 0
+@@ -44,6 +44,8 @@ class StreamingHDF5DatasetFileHandler(DatasetFileHandlerBase):
+ 
+         # Multiple concurrent open episodes, keyed by episode index
+         self._open_episodes: dict[int, _OpenEpisode] = {}
++        self._compression = compression
++        self._image_chunk_frames = image_chunk_frames
+ 
+         # Best-effort: finalize open episodes and close the file on interpreter
+         # exit (covers KeyboardInterrupt and most unhandled exceptions). __del__
+@@ -164,6 +166,13 @@ class StreamingHDF5DatasetFileHandler(DatasetFileHandlerBase):
+         """Check if there's any active episode being written."""
+         return len(self._open_episodes) > 0
+ 
++    def next_available_episode_index(self) -> int:
++        """Return an episode index that is unused on disk and in this process."""
++        index = self._demo_count
++        while index in self._open_episodes or f"demo_{index}" in self._hdf5_data_group:
++            index += 1
++        return index
++
+     def get_episode_stats(self) -> dict:
+         """Get statistics about the current state of the handler."""
+         stats = {
+@@ -237,7 +246,7 @@ class StreamingHDF5DatasetFileHandler(DatasetFileHandlerBase):
+         self._open_episodes[episode_index] = ep
+         return episode_index
+ 
+-    def append_data(self, episode: EpisodeData, episode_index: int = None):
++    def append_data(self, episode: EpisodeData, episode_index: int = None, flush: bool = True):
+         """Append episode data to an open episode.
+ 
+         If the episode is not yet open, it will be opened automatically.
+@@ -270,7 +279,14 @@ class StreamingHDF5DatasetFileHandler(DatasetFileHandlerBase):
+ 
+         # Append all data
+         for key, value in episode.data.items():
+-            self._append_to_dataset(ep.group, key, value, ep.datasets)
++            self._append_to_dataset(
++                ep.group,
++                key,
++                value,
++                ep.datasets,
++                compression=self._compression,
++                image_chunk_frames=self._image_chunk_frames,
++            )
+ 
+         # Update num_samples from actions shape
+         if "actions" in episode.data:
+@@ -278,7 +294,8 @@ class StreamingHDF5DatasetFileHandler(DatasetFileHandlerBase):
+             if actions_key in ep.datasets:
+                 ep.group.attrs["num_samples"] = ep.datasets[actions_key].shape[0]
+ 
+-        self._hdf5_file_stream.flush()
++        if flush:
++            self._hdf5_file_stream.flush()
+ 
+     def end_episode(self, success: bool = None, episode_index: int = None):
+         """Finalize an open episode.
+@@ -409,7 +426,14 @@ class StreamingHDF5DatasetFileHandler(DatasetFileHandlerBase):
+         return np.asarray(value)
+ 
+     @staticmethod
+-    def _append_to_dataset(group, key, value, datasets_cache):
++    def _append_to_dataset(
++        group,
++        key,
++        value,
++        datasets_cache,
++        compression="gzip",
++        image_chunk_frames=None,
++    ):
+         """Append data to a resizable HDF5 dataset, creating it if needed."""
+         if isinstance(value, dict):
+             if key not in group:
+@@ -418,7 +442,12 @@ class StreamingHDF5DatasetFileHandler(DatasetFileHandlerBase):
+                 key_group = group[key]
+             for sub_key, sub_value in value.items():
+                 StreamingHDF5DatasetFileHandler._append_to_dataset(
+-                    key_group, sub_key, sub_value, datasets_cache
++                    key_group,
++                    sub_key,
++                    sub_value,
++                    datasets_cache,
++                    compression=compression,
++                    image_chunk_frames=image_chunk_frames,
+                 )
+         else:
+             np_data = StreamingHDF5DatasetFileHandler._leaf_to_numpy(group, key, value)
+@@ -432,12 +461,16 @@ class StreamingHDF5DatasetFileHandler(DatasetFileHandlerBase):
+                 dataset[old_size:new_size] = np_data
+             else:
+                 maxshape = (None,) + np_data.shape[1:]
++                is_image = np_data.ndim == 4 and np_data.dtype == np.uint8
++                chunks = True
++                if is_image and image_chunk_frames is not None:
++                    chunks = (min(image_chunk_frames, np_data.shape[0]),) + np_data.shape[1:]
+                 dataset = group.create_dataset(
+                     key,
+                     data=np_data,
+                     maxshape=maxshape,
+-                    chunks=True,
+-                    compression="gzip"
++                    chunks=chunks,
++                    compression=compression,
+                 )
+                 datasets_cache[cache_key] = dataset
+ 
+diff --git a/robolab/eval/runner.py b/robolab/eval/runner.py
+index 12688c2..7eddfe8 100644
+--- a/robolab/eval/runner.py
++++ b/robolab/eval/runner.py
+@@ -110,6 +110,14 @@ def add_common_eval_args(parser: argparse.ArgumentParser) -> None:
+                               "RenderCfg.rendering_mode). Default: unset, which lets "
+                               "IsaacLab fall back to 'balanced'. No effect under "
+                               "--renderer pathtracing."))
++    parser.add_argument("--record-flush-interval", "--record_flush_interval", type=int, default=None,
++                        help=("HDF5 recorder chunk size in environment steps. The default is "
++                              "set by --record-storage-profile. Lower values "
++                              "reduce host-memory peaks but write more often; 0 disables "
++                              "periodic flushing."))
++    parser.add_argument("--record-storage-profile", choices=("fast", "balanced", "compact"), default=None,
++                        help=("HDF5 image storage: fast is uncompressed and throughput-oriented; "
++                              "balanced uses LZF; compact uses gzip. Image recording defaults to fast."))
+ 
+ 
+ def run_evaluation(
+@@ -210,6 +218,10 @@ def run_evaluation(
+             renderer=args.renderer,
+             rendering_mode=args.rendering_type,
+         )
++        if args.record_storage_profile is not None:
++            env.recorder_manager.set_storage_profile(args.record_storage_profile)
++        if args.record_flush_interval is not None:
++            env.recorder_manager.set_flush_interval(args.record_flush_interval)
+ 
+         if robolab.constants.ENABLE_SUBTASK_PROGRESS_CHECKING and getattr(env_cfg, "subtasks", None) is None:
+             print(
+diff --git a/scripts/validate_recording.py b/scripts/validate_recording.py
+new file mode 100644
+index 0000000..db6b0b6
+--- /dev/null
++++ b/scripts/validate_recording.py
+@@ -0,0 +1,72 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""Validate the structural contract of a multi-env RoboLab HDF5 recording."""
++
++import argparse
++import json
++from pathlib import Path
++
++import h5py
++import numpy as np
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("recording", type=Path)
++    parser.add_argument("--expected-demos", type=int, required=True)
++    parser.add_argument("--expected-steps", type=int, required=True)
++    args = parser.parse_args()
++
++    errors = []
++    summary = {"recording": str(args.recording), "demos": {}}
++    with h5py.File(args.recording, "r") as dataset:
++        if "data" not in dataset:
++            raise SystemExit("missing /data group")
++        data = dataset["data"]
++        demos = sorted(data.keys(), key=lambda name: int(name.removeprefix("demo_")))
++        if len(demos) != args.expected_demos:
++            errors.append(f"expected {args.expected_demos} demos, found {len(demos)}")
++
++        summary["provenance"] = json.loads(data.attrs.get("env_args", "{}"))
++        for name in demos:
++            demo = data[name]
++            actions = demo.get("actions")
++            if actions is None or actions.shape[0] != args.expected_steps:
++                errors.append(f"{name}: actions steps={None if actions is None else actions.shape[0]}")
++
++            initial_state = demo.get("initial_state/articulation/robot/joint_position")
++            if initial_state is None or initial_state.shape[0] != 1:
++                errors.append(f"{name}: expected one robot initial state")
++
++            images = {}
++            image_group = demo.get("obs/image_obs")
++            if image_group is None:
++                errors.append(f"{name}: missing obs/image_obs")
++            else:
++                for camera, image in image_group.items():
++                    images[camera] = {"shape": list(image.shape), "dtype": str(image.dtype)}
++                    if image.shape[0] != args.expected_steps:
++                        errors.append(f"{name}/{camera}: image steps={image.shape[0]}")
++                    if image.dtype != np.uint8 or image.ndim != 4 or image.shape[-1] != 3:
++                        errors.append(f"{name}/{camera}: expected TxHxWx3 uint8, got {image.shape} {image.dtype}")
++
++            if demo.get("obs/viewport_cam") is not None:
++                errors.append(f"{name}: viewport-only observations were recorded")
++            summary["demos"][name] = {
++                "steps": None if actions is None else actions.shape[0],
++                "images": images,
++            }
++
++        expected_total = args.expected_demos * args.expected_steps
++        if int(data.attrs.get("total", -1)) != expected_total:
++            errors.append(f"expected total={expected_total}, found {data.attrs.get('total')}")
++
++    summary["valid"] = not errors
++    summary["errors"] = errors
++    print(json.dumps(summary, indent=2))
++    return 0 if not errors else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_recorder_cpu_streaming.py b/tests/test_recorder_cpu_streaming.py
+new file mode 100644
+index 0000000..1456d12
+--- /dev/null
++++ b/tests/test_recorder_cpu_streaming.py
+@@ -0,0 +1,136 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++from types import SimpleNamespace
++
++import h5py
++import torch
++from isaaclab.managers.recorder_manager import DatasetExportMode
++from isaaclab.utils.datasets import EpisodeData
++
++from robolab.core.logging.recorder_manager import (
++    RobolabRecorderManager,
++    _ChunkedEpisodeData,
++    _to_recording_device,
++)
++from robolab.core.logging.streaming_hdf5_handler import StreamingHDF5DatasetFileHandler
++
++
++def _assert_cpu_tree(value):
++    if isinstance(value, dict):
++        for item in value.values():
++            _assert_cpu_tree(item)
++    elif isinstance(value, torch.Tensor):
++        assert value.device.type == "cpu"
++
++
++def test_to_recording_device_detaches_nested_tensors():
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    source = torch.arange(12, device=device, dtype=torch.float32).reshape(1, 3, 4).requires_grad_()
++    converted = _to_recording_device(
++        {"rgb": source, "nested": {"state": source + 1}, "sequence": [source + 2]}
++    )
++
++    _assert_cpu_tree(converted)
++    assert not converted["rgb"].requires_grad
++    assert converted["sequence"][0].device.type == "cpu"
++    torch.testing.assert_close(converted["rgb"], source.detach().cpu())
++
++
++def test_manager_buffer_never_owns_cuda_tensors():
++    manager = object.__new__(RobolabRecorderManager)
++    manager._term_names = ["record_policy_observations"]
++    manager._episodes = {0: EpisodeData()}
++    manager._env = SimpleNamespace(num_envs=1)
++    manager._record_on_cpu = True
++
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    observation = {
++        "camera": torch.zeros((1, 8, 12, 3), dtype=torch.uint8, device=device),
++        "proprio": torch.ones((1, 7), device=device),
++    }
++    manager.add_to_episodes("obs", observation)
++
++    _assert_cpu_tree(manager._episodes[0].data)
++    assert manager._episodes[0].data["obs"]["camera"].shape == (1, 8, 12, 3)
++
++
++def test_implicit_streaming_indices_keep_parallel_envs_separate(tmp_path):
++    handler = StreamingHDF5DatasetFileHandler()
++    handler.create(str(tmp_path / "parallel.hdf5"))
++
++    manager = object.__new__(RobolabRecorderManager)
++    manager._term_names = ["record_policy_observations"]
++    manager._episodes = {env_id: EpisodeData() for env_id in range(3)}
++    manager._current_episode_index = {env_id: None for env_id in range(3)}
++    manager._streaming_active = {env_id: False for env_id in range(3)}
++    manager._terms = {}
++    manager._dataset_file_handler = handler
++    manager._failed_episode_dataset_file_handler = None
++    manager._hdf5_initialized = True
++    manager._env = SimpleNamespace(num_envs=3)
++    manager._record_on_cpu = True
++    manager.cfg = SimpleNamespace(dataset_export_mode=DatasetExportMode.EXPORT_ALL)
++    manager._exported_successful_episode_count = {}
++    manager._exported_failed_episode_count = {}
++    manager._step_count = {env_id: 0 for env_id in range(3)}
++
++    for step in range(5):
++        manager.add_to_episodes(
++            "actions",
++            torch.tensor([[step, env_id] for env_id in range(3)], dtype=torch.float32),
++        )
++    manager.flush_buffer(verbose=False)
++
++    for step in range(5, 8):
++        manager.add_to_episodes(
++            "actions",
++            torch.tensor([[step, env_id] for env_id in range(3)], dtype=torch.float32),
++        )
++    manager.flush_buffer(verbose=False)
++    manager.export_episodes()
++    handler.close()
++
++    with h5py.File(tmp_path / "parallel.hdf5", "r") as dataset:
++        assert sorted(dataset["data"].keys()) == ["demo_0", "demo_1", "demo_2"]
++        assert dataset["data"].attrs["total"] == 24
++        for env_id in range(3):
++            actions = dataset[f"data/demo_{env_id}/actions"][:]
++            assert actions.shape == (8, 2)
++            torch.testing.assert_close(
++                torch.from_numpy(actions[:, 1]),
++                torch.full((8,), env_id, dtype=torch.float32),
++            )
++
++
++def test_fast_handler_uses_uncompressed_frame_chunks(tmp_path):
++    handler = StreamingHDF5DatasetFileHandler(compression=None, image_chunk_frames=1)
++    handler.create(str(tmp_path / "fast.hdf5"))
++    episode = EpisodeData()
++    episode.add("obs/image_obs/camera", torch.zeros((8, 12, 3), dtype=torch.uint8))
++    handler.write_episode(episode)
++    handler.close()
++
++    with h5py.File(tmp_path / "fast.hdf5", "r") as dataset:
++        image = dataset["data/demo_0/obs/image_obs/camera"]
++        assert image.compression is None
++        assert image.chunks == (1, 8, 12, 3)
++
++
++def test_chunked_episode_materializes_each_leaf_once():
++    episode = _ChunkedEpisodeData()
++    source = torch.arange(24, dtype=torch.float32).reshape(3, 2, 4)
++    for step in source:
++        episode.add("obs/proprio", step)
++
++    assert not episode.is_empty()
++    assert len(episode._chunks["obs/proprio"]) == 3
++    materialized = episode.data
++    torch.testing.assert_close(materialized["obs"]["proprio"], source)
++    assert episode.data["obs"]["proprio"].data_ptr() == materialized["obs"]["proprio"].data_ptr()
++
++
++def test_chunked_episode_preserves_nontensor_leaves_for_export():
++    episode = _ChunkedEpisodeData()
++    episode.add("initial_state/object/root_pose", [0.0, 0.0, 0.0, 1.0])
++    assert episode.data["initial_state"]["object"]["root_pose"] == [[0.0, 0.0, 0.0, 1.0]]
+-- 
+2.34.1
+

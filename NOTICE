@@ -57,6 +57,14 @@ Notice:
 File:
   cosmos_framework/utils/lazy_config/__init__.py
 
+SageAttention
+Source: https://github.com/thu-ml/SageAttention
+License: Apache-2.0
+Notice:
+  Copyright (c) 2024 SageAttention team.
+File:
+  cosmos_framework/model/attention/sage/functions.py
+
 TaylorSeer
 Source: https://github.com/Shenyi-Z/TaylorSeer
 License: GPL-3.0

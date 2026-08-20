@@ -14,6 +14,7 @@ from cosmos_framework.model.generator.mot.attention import (
     build_packed_sequence,
 )
 from cosmos_framework.data.generator.sequence_packing.runtime import (
+    from_und_gen_splits,
     get_all_seq,
     get_gen_seq,
     get_und_seq,
@@ -21,6 +22,7 @@ from cosmos_framework.data.generator.sequence_packing.runtime import (
     set_und_seq,
     zeros_like,
 )
+from cosmos_framework.model.generator.utils.memory import ConditionKVCacheValue
 
 MAX_SEQ_LEN = 24
 SEQS_PER_BATCH = 4
@@ -412,6 +414,57 @@ def test_dispatch_attention_rejects_incomplete_split_info() -> None:
             object(),
             foreign_split_info,
         )
+
+
+@pytest.mark.L0
+def test_dispatch_attention_rejects_unrelated_memory_value() -> None:
+    with pytest.raises(TypeError, match="does not handle SimpleNamespace"):
+        attention.dispatch_attention(
+            object(),
+            object(),
+            object(),
+            _foreign_split_info(),
+            memory_value=cast(object, SimpleNamespace(frame_idx=1)),
+        )
+
+
+@pytest.mark.L0
+def test_dispatch_attention_condition_cache_concatenates_und_before_current_gen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packed = torch.randn(3, 2, 4)
+    pack = attention.sequence_pack_from_packed_sequence(
+        packed,
+        attn_modes=["causal", "full"],
+        split_lens=[1, 2],
+        sample_lens=[3],
+        packed_und_token_indexes=torch.tensor([0]),
+        packed_gen_token_indexes=torch.tensor([1, 2]),
+    )
+    gen_only_pack = from_und_gen_splits(pack["causal_seq"][:0], pack["full_only_seq"], pack)
+    cached_k = torch.full((1, 1, 2, 4), 7.0)
+    cached_v = torch.full((1, 1, 2, 4), 9.0)
+    seen: dict[str, torch.Tensor] = {}
+
+    def fake_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **_: object) -> torch.Tensor:
+        seen.update(q=q, k=k, v=v)
+        return q
+
+    monkeypatch.setattr(attention, "attention", fake_attention)
+    output, kv_to_store = attention.dispatch_attention(
+        gen_only_pack,
+        gen_only_pack,
+        gen_only_pack,
+        _foreign_split_info(),
+        memory_value=ConditionKVCacheValue(und_k=cached_k, und_v=cached_v, frame_idx=1),
+    )
+
+    assert output["causal_seq"].shape == (0, 8)
+    assert output["full_only_seq"].shape == (2, 8)
+    torch.testing.assert_close(seen["k"][:, :1], cached_k)
+    torch.testing.assert_close(seen["v"][:, :1], cached_v)
+    torch.testing.assert_close(seen["k"][:, 1:], pack["full_only_seq"].unsqueeze(0))
+    assert kv_to_store is None
 
 
 @pytest.mark.L0

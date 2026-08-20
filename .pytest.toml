@@ -19,6 +19,8 @@ filterwarnings = [
     "ignore::FutureWarning",
 ]
 markers = [
+    "CPU: Test does not require a GPU.",
+    "L0: Fast unit-level test.",
     "manual: Test requires --manual.",
     "level(l): Test level <l> in [0, 1, 2].",
     "gpus(n): Test requires <n> GPUs.",

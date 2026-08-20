@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "integration": "robolab-cosmos-droid-trajectory-recorder",
+  "upstream_repository": "https://github.com/NVlabs/RoboLab",
+  "upstream_release": "v0.3.1",
+  "upstream_base_commit": "9db0aaf",
+  "patches": [
+    "0001-bounded-cpu-streaming-image-recorder.patch",
+    "0002-Add-training-ready-Cosmos-DROID-trajectory-export.patch"
+  ],
+  "validated_on": "2026-08-20"
+}

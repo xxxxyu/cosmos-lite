@@ -13,6 +13,8 @@ from typing import Any
 
 from cosmos_framework.scripts.robolab_quant_bundle import (
     build_robolab_quant_bundle,
+    convert_gen_w8_bundle_to_w8a8,
+    convert_w8_bundle_to_w8a8,
     discover_quant_targets,
     validate_robolab_quant_bundle,
 )
@@ -25,6 +27,7 @@ _QWEN_REPOSITORY = "Qwen/Qwen3-VL-8B-Instruct"
 _QWEN_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 _WAN_REPOSITORY = "Wan-AI/Wan2.2-TI2V-5B"
 _WAN_REVISION = "921dbaf3f1674a56f47e83fb80a34bac8a8f203e"
+_PUBLIC_STRATEGIES = ("full_w8", "gen_branch_w8a8")
 
 
 def _prepare_public_sources(
@@ -134,6 +137,19 @@ def _add_public_source_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--wan-revision", default=_WAN_REVISION)
 
 
+def _load_source_provenance(path: str | Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    provenance_path = Path(path).expanduser().resolve()
+    value = json.loads(provenance_path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"Source provenance must contain a JSON object: {provenance_path}")
+    for field in ("repositories", "resolved_revisions"):
+        if not isinstance(value.get(field), dict):
+            raise ValueError(f"Source provenance has no {field!r} mapping: {provenance_path}")
+    return value
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -153,6 +169,31 @@ def _parser() -> argparse.ArgumentParser:
     build_parser.add_argument("--calibration-alpha", type=float, default=0.5)
     build_parser.add_argument("--copy-mode", choices=("copy", "hardlink"), default="copy")
     build_parser.add_argument("--max-residual-shard-size", type=int, default=2 * 1024**3)
+    build_parser.add_argument("--source-provenance-json")
+
+    convert_parser = subparsers.add_parser(
+        "convert-gen-w8-to-w8a8",
+        help="Reuse a calibrated GenW8 bundle and convert its generation branch to FP8 W8A8",
+    )
+    convert_parser.add_argument("--base-bundle", required=True)
+    convert_parser.add_argument("--source-checkpoint", required=True)
+    convert_parser.add_argument("--output-dir", required=True)
+    convert_parser.add_argument("--device", default="cuda:0")
+    convert_parser.add_argument("--copy-mode", choices=("copy", "hardlink"), default="hardlink")
+    convert_parser.add_argument("--calibration-stats")
+    convert_parser.add_argument("--calibration-alpha", type=float, default=0.5)
+
+    convert_full_parser = subparsers.add_parser(
+        "convert-full-w8-to-w8a8",
+        help="Convert every W8A16 Linear in a FullW8 bundle to FP8 W8A8",
+    )
+    convert_full_parser.add_argument("--base-bundle", required=True)
+    convert_full_parser.add_argument("--source-checkpoint", required=True)
+    convert_full_parser.add_argument("--output-dir", required=True)
+    convert_full_parser.add_argument("--device", default="cuda:0")
+    convert_full_parser.add_argument("--copy-mode", choices=("copy", "hardlink"), default="hardlink")
+    convert_full_parser.add_argument("--calibration-stats")
+    convert_full_parser.add_argument("--calibration-alpha", type=float, default=0.5)
 
     validate_parser = subparsers.add_parser("validate", help="Validate a deployment bundle")
     validate_parser.add_argument("--bundle-dir", required=True)
@@ -167,7 +208,7 @@ def _parser() -> argparse.ArgumentParser:
         "build-public", help="Download the public DROID policy inputs and stream-pack a bundle"
     )
     _add_public_source_arguments(public_parser)
-    public_parser.add_argument("--strategy", default="full_w8")
+    public_parser.add_argument("--strategy", choices=_PUBLIC_STRATEGIES, default="full_w8")
     public_parser.add_argument("--output-dir", required=True)
     public_parser.add_argument("--device", default="cuda:0")
     public_parser.add_argument("--calibration-stats")
@@ -200,6 +241,28 @@ def main() -> None:
             calibration_alpha=args.calibration_alpha,
             copy_mode=args.copy_mode,
             max_residual_shard_size=args.max_residual_shard_size,
+            source_provenance=_load_source_provenance(args.source_provenance_json),
+        )
+    elif args.command == "convert-gen-w8-to-w8a8":
+        result = convert_gen_w8_bundle_to_w8a8(
+            base_bundle=args.base_bundle,
+            source_checkpoint=args.source_checkpoint,
+            output_dir=args.output_dir,
+            device=args.device,
+            copy_mode=args.copy_mode,
+            calibration_stats=args.calibration_stats,
+            calibration_alpha=args.calibration_alpha,
+        )
+    elif args.command == "convert-full-w8-to-w8a8":
+        result = convert_w8_bundle_to_w8a8(
+            base_bundle=args.base_bundle,
+            source_checkpoint=args.source_checkpoint,
+            output_dir=args.output_dir,
+            device=args.device,
+            copy_mode=args.copy_mode,
+            calibration_stats=args.calibration_stats,
+            calibration_alpha=args.calibration_alpha,
+            strategy="full_w8a8",
         )
     elif args.command == "validate":
         result = validate_robolab_quant_bundle(

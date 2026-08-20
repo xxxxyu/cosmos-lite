@@ -19,6 +19,8 @@ jobs:
   quant-unit-tests:
     runs-on: ${{ fromJSON(inputs.runner_label) }}
     timeout-minutes: 30
+    env:
+      COSMOS_TRAINING: "0"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -26,14 +28,25 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Install locked policy runtime
         run: CUDA_VISIBLE_DEVICES=0 examples/quantized_robot_policy/setup.sh
+      - name: Install test-only dependencies
+        run: |
+          uv pip install \
+            --python examples/quantized_robot_policy/.venv/bin/python \
+            pytest-custom-exit-code==0.3.0 \
+            pytest-xdist==3.8.0
       - name: Run quantization unit tests
         run: |
           examples/quantized_robot_policy/.venv/bin/python -m pytest -q \
+            cosmos_framework/model/attention/sage/checks_test.py \
+            cosmos_framework/model/generator/utils/memory_test.py \
             cosmos_framework/scripts/action_policy_server_robocasa365_quant_test.py \
             cosmos_framework/scripts/action_policy_server_robolab_test.py \
             cosmos_framework/scripts/export_robolab_train_calibration_requests_test.py \
             cosmos_framework/scripts/robocasa365_quant_pipeline_test.py \
+            cosmos_framework/scripts/robolab_deployment_config_test.py \
+            cosmos_framework/scripts/robolab_fp8_backend_test.py \
             cosmos_framework/scripts/robolab_quant_bundle_test.py \
-            cosmos_framework/scripts/robolab_quant_pipeline_test.py
+            cosmos_framework/scripts/robolab_quant_pipeline_test.py \
+            cosmos_framework/scripts/robolab_quant_runtime_test.py
       - name: Check Marlin runtime
         run: CUDA_VISIBLE_DEVICES=0 examples/quantized_robot_policy/.venv/bin/python examples/quantized_robot_policy/check_runtime.py
