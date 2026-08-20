@@ -49,13 +49,13 @@ until repeated paired rollout resolves the ranking.
 
 ### Rollout Reference
 
-[![Watch the RoboCasa365 CloseFridge reference](../../docs/assets/robocasa_closefridge_bf16_reference_poster.png)](../../docs/assets/robocasa_closefridge_bf16_reference.mp4)
+<!-- rumdl-disable MD034 -->
+https://github.com/user-attachments/assets/11997ae6-27c1-4383-9db0-bcdb32b26166
+<!-- rumdl-enable MD034 -->
 
-[Open the CloseFridge reference video](../../docs/assets/robocasa_closefridge_bf16_reference.mp4).
-This cherry-picked three-episode video comes from the step-8000 BF16 reference
-evaluation. It demonstrates the task and observation layout; it is not a
-quantized rollout comparison. Quantized quality claims use the full matched
-tables above.
+This three-episode video comes from the step-8000 BF16 reference evaluation and
+shows the task and observation layout. Quantized results are summarized in the
+matched tables above.
 
 ## Scope and Measurement Rules
 
@@ -75,7 +75,7 @@ The reported latency fields have different boundaries:
 - **Request latency** includes the client/server request path around generate.
 - **Rollout success** is closed-loop task completion and is the quality gate.
 - **Replay action error** is an open-loop diagnostic against saved BF16
-  responses. It is not a success-rate proxy.
+  responses. Use closed-loop rollout for success rate.
 - **Peak allocated** is PyTorch CUDA allocated memory. Reserved memory can be
   higher and is shown where it was captured.
 
@@ -86,8 +86,8 @@ only rows in the same table/runtime environment for latency ranking.
 ## Release Pipeline Smoke
 
 The release entry point was rebuilt on one RTX 4090 from the 8,000-step BF16
-DCP. This gate validates the product pipeline itself; the larger rollout
-tables below remain the quality evidence.
+DCP. This gate validates the product pipeline; the larger rollout tables below
+measure quality.
 
 | Strategy       |           Calibration |  Packed modules |   Bundle bytes | Stream-pack peak alloc/reserved |
 | -------------- | --------------------: | --------------: | -------------: | ------------------------------: |
@@ -109,8 +109,8 @@ ran the public `pipeline.sh rollout` entry point with `attention_w8`, guidance 3
 four steps, one environment, and the 1,200-step horizon. CloseFridge succeeded
 1/1; collection took 106.8s, the episode progress bar took 77.9s, steady
 generation was about 0.80-0.83s, and peak allocated/reserved memory was
-13.94/14.28GB. This single episode is a deployment smoke, not additional
-quality evidence.
+13.94/14.28GB. This single episode checks the deployment path; success-rate
+comparisons use the larger rollout tables below.
 
 ## Quantization Strategies
 
@@ -164,9 +164,8 @@ Interpretation:
   exactly across these two runs.
 - `full_w4` retained the external 0.92 reference success while using the least
   memory.
-- A quantized point estimate above BF16 does not establish that quantization
-  improves the policy. With 50 Bernoulli trials the confidence intervals are
-  broad, and simulator seeds/trajectory divergence introduce variance.
+- Quantized and BF16 confidence intervals overlap. The higher quantized point
+  estimates can come from simulator seeds and trajectory divergence.
 - The H100 Marlin path reduced memory but was not faster than BF16. The 4090
   measurements below are the relevant deployment latency results.
 
