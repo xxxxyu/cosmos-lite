@@ -1,0 +1,31 @@
+schema_version: 1
+profile: nano_w8
+model:
+  artifact: quantized_bundle
+  family: cosmos3_nano
+  bundle_dir: null
+  strategy: full_w8
+sampling:
+  guidance: 3.0
+  denoise_steps: 2
+  shift: 5.0
+  seed: 0
+  deterministic_seed: true
+runtime:
+  backend_policy: strict
+  torch_compile: false
+  cuda_graphs: false
+  compiled_region: language
+  compile_dynamic: true
+  fp8_projection_fusion: none
+  fp8_gemm_backend: cutlass
+  attention_backend: flash_attention_2
+  sage_pv: fp8_fp32_fp32
+  condition_kv_cache: false
+  sparse_video_transform: true
+  vae_encode_chunk_frames: 8
+server:
+  host: 127.0.0.1
+  port: 8000
+  output_dir: outputs/robolab_nano_w8
+  profile_jsonl: null

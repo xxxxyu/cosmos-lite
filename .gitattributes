@@ -1,6 +1,7 @@
 *.lock linguist-generated=true
 tests/data/** linguist-generated=true
 ATTRIBUTIONS.md linguist-generated=true
+*.patch linguist-generated=true whitespace=-blank-at-eol,-blank-at-eof
 
 assets/** filter=lfs diff=lfs merge=lfs -text
 

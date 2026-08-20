@@ -259,7 +259,13 @@ _WHITELIST_ENV_VARS = {
     "NVTE_CUDA_INCLUDE_DIR",
     "QT_QPA_FONTDIR",
     "QT_QPA_PLATFORM_PLUGIN_PATH",
+    # vLLM sets these process-wide defaults when its custom-op package is first
+    # imported. They configure CUDA availability checks and compilation only;
+    # tests do not mutate them directly.
+    "PYTORCH_NVML_BASED_CUDA_CHECK",
+    "TORCHINDUCTOR_COMPILE_THREADS",
     "TORCHINDUCTOR_CACHE_DIR",
+    "TRITON_CACHE_AUTOTUNING",
     "TRITON_CACHE_DIR",  # set by Triton during flex-attention compilation
     "NVTE_CUDA_INCLUDE_DIR",  # set by Transformer Engine during its CUDA extension setup
 }
