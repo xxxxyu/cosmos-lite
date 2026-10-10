@@ -86,6 +86,11 @@ evaluation shares policy servers across simulator lanes.
 | Edge GenW8A8 |           2 |              6 |                         10 |
 
 Topology changes throughput, not the episode protocol or success accounting.
+For asynchronous scheduler research, vector width and shared-server load also
+change wall-clock waiting and action age. Keep those settings fixed within a
+method comparison; do not pool vectorized timing with isolated single-environment
+timing. The [configurable vector harness](../../examples/robolab_quant/evaluation/README.md)
+records batch/environment identities and reports whole-campaign throughput.
 These layouts were measured with training-trajectory recording disabled.
 Saving LeRobot training streams or full-resolution HDF5 images changes
 simulator GPU, host-memory, CPU, and disk requirements; follow the separate

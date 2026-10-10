@@ -174,3 +174,10 @@ Retain these files with every result:
 To build W8A16 or GenW8A8 instead of downloading it, see
 [Building model artifacts](../../docs/model_build.md). Experimental strategies
 and backend studies are indexed under [Documentation](../../docs/README.md).
+
+### Configurable vector evaluation
+
+For multiple independent simulator lanes and per-environment asynchronous action
+state, see [the vector evaluation harness](evaluation/README.md). Its throughput
+metrics and vector seed protocol are separate from isolated deployment-latency
+measurements.

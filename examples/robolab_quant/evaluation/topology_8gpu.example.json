@@ -1,0 +1,76 @@
+{
+  "sim_python": "/path/to/robolab-env/bin/python",
+  "robolab_repo": "/path/to/RoboLab",
+  "policy_gpus": [
+    0,
+    1
+  ],
+  "horizon": 16,
+  "delay_s": 0.1,
+  "jitter_s": 0.075,
+  "seed_offset": 3000,
+  "timeout_s": 7200,
+  "sim_env": {},
+  "lanes": [
+    {
+      "name": "lane0",
+      "sim_gpu": 2,
+      "task": "BananaInBowlTask",
+      "mode": "sync",
+      "host": "127.0.0.1",
+      "port": 8972,
+      "num_envs": 10,
+      "num_runs": 2
+    },
+    {
+      "name": "lane1",
+      "sim_gpu": 3,
+      "task": "BananaInBowlTask",
+      "mode": "timestamp",
+      "host": "127.0.0.1",
+      "port": 8973,
+      "num_envs": 10,
+      "num_runs": 2
+    },
+    {
+      "name": "lane2",
+      "sim_gpu": 4,
+      "task": "BananaInBowlTask",
+      "mode": "blend",
+      "host": "127.0.0.1",
+      "port": 8972,
+      "num_envs": 10,
+      "num_runs": 2
+    },
+    {
+      "name": "lane3",
+      "sim_gpu": 5,
+      "task": "RubiksCubeTask",
+      "mode": "sync",
+      "host": "127.0.0.1",
+      "port": 8973,
+      "num_envs": 10,
+      "num_runs": 2
+    },
+    {
+      "name": "lane4",
+      "sim_gpu": 6,
+      "task": "RubiksCubeTask",
+      "mode": "timestamp",
+      "host": "127.0.0.1",
+      "port": 8972,
+      "num_envs": 10,
+      "num_runs": 2
+    },
+    {
+      "name": "lane5",
+      "sim_gpu": 7,
+      "task": "RubiksCubeTask",
+      "mode": "blend",
+      "host": "127.0.0.1",
+      "port": 8973,
+      "num_envs": 10,
+      "num_runs": 2
+    }
+  ]
+}
